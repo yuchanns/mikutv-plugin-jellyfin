@@ -1,0 +1,90 @@
+{
+  "id": "jellyfin",
+  "name": "Jellyfin",
+  "description": "Stream movies, TV shows, and personal media from your self-hosted Jellyfin server.",
+  "kind": "source",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "minAppVersion": "0.1.0",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "artwork": {
+    "cover": "cover.png"
+  },
+  "permissions": {
+    "network": []
+  },
+  "authentication": {
+    "methods": [
+      "credentials"
+    ],
+    "serverURL": "required",
+    "presentation": {
+      "accountSubtitle": "Self-hosted Jellyfin media server",
+      "guestTitle": "Connect to Jellyfin",
+      "guestDescription": "Sign in with your Jellyfin server URL and account to browse movies, series, and resume watching.",
+      "credentialsTitle": "Sign In to Jellyfin",
+      "credentialsDescription": "Enter your Jellyfin server URL, username, and password.",
+      "serverURLPlaceholder": "http://192.168.1.10:8096",
+      "usernamePlaceholder": "Username"
+    }
+  },
+  "presentation": {
+    "creatorGroupTitle": "Continue Watching",
+    "search": {
+      "hint": "Search movies, TV shows, and episodes in your Jellyfin library"
+    }
+  },
+  "capabilities": [
+    "account.signIn",
+    "catalog.browse",
+    "catalog.item",
+    "catalog.search",
+    "catalog.library",
+    "account.history",
+    "account.favorites",
+    "playback.resolve",
+    "playback.subtitles",
+    "playback.progress"
+  ],
+  "locales": {
+    "zh-Hans": {
+      "name": "Jellyfin",
+      "description": "连接自建 Jellyfin 媒体服务器，在大屏浏览电影、剧集并续播进度。",
+      "authentication": {
+        "accountSubtitle": "自建 Jellyfin 媒体服务器",
+        "guestTitle": "连接 Jellyfin 媒体库",
+        "guestDescription": "输入你的 Jellyfin 服务器地址与账号，即可在 Apple TV 上浏览电影、剧集并同步续播进度。",
+        "credentialsTitle": "登录 Jellyfin",
+        "credentialsDescription": "输入服务器地址、用户名与密码（密码可留空）。",
+        "serverURLPlaceholder": "http://192.168.1.10:8096",
+        "usernamePlaceholder": "用户名"
+      },
+      "presentation": {
+        "creatorGroupTitle": "继续观看",
+        "search": {
+          "hint": "搜索 Jellyfin 媒体库中的电影、剧集与单集"
+        }
+      }
+    },
+    "ja": {
+      "name": "Jellyfin",
+      "description": "セルフホストの Jellyfin サーバーに接続し、映画・ドラマ・視聴途中の作品を大画面で再生。",
+      "authentication": {
+        "accountSubtitle": "セルフホスト Jellyfin サーバー",
+        "guestTitle": "Jellyfin に接続",
+        "guestDescription": "Jellyfin のサーバー URL とアカウントでサインインし、ライブラリを閲覧します。",
+        "credentialsTitle": "Jellyfin にサインイン",
+        "credentialsDescription": "サーバー URL、ユーザー名、パスワードを入力してください。",
+        "serverURLPlaceholder": "http://192.168.1.10:8096",
+        "usernamePlaceholder": "ユーザー名"
+      },
+      "presentation": {
+        "creatorGroupTitle": "視聴を続ける",
+        "search": {
+          "hint": "Jellyfin ライブラリから映画・シリーズ・エピソードを検索"
+        }
+      }
+    }
+  }
+}
