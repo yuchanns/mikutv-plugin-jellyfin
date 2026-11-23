@@ -580,8 +580,8 @@ export async function browse(req) {
     }
 
     const shelves = [];
-    if (resumeItems.length > 0) {
-      shelves.push({ id: "resume", title: copy.continueWatching, items: resumeItems });
+    if (moviesItems.length > 0) {
+      shelves.push({ id: "movies-shelf", title: moviesTitle, items: moviesItems.slice(0, 12) });
     } else if (seriesItems.length > 0) {
       shelves.push({ id: "series-shelf", title: seriesTitle, items: seriesItems.slice(0, 12) });
     }
