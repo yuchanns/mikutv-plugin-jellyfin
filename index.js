@@ -669,7 +669,19 @@ async function fetchSeriesEpisodes(s, seriesId) {
       qs({ UserId: s.userId, Fields: "Overview,MediaSources", Limit: 200 }),
     { deviceId: s.deviceId, token: s.accessToken }
   );
-  const list = (data && Array.isArray(data.Items)) ? data.Items : [];
+  const rawList = (data && Array.isArray(data.Items)) ? data.Items : [];
+  // Place regular seasons (Season 1+) ahead of Specials (Season 0).
+  const list = rawList.slice().sort((a, b) => {
+    const sa = a.ParentIndexNumber != null ? Number(a.ParentIndexNumber) : 9999;
+    const sb = b.ParentIndexNumber != null ? Number(b.ParentIndexNumber) : 9999;
+    const ra = sa === 0 ? 1 : 0;
+    const rb = sb === 0 ? 1 : 0;
+    if (ra !== rb) return ra - rb;
+    if (sa !== sb) return sa - sb;
+    const ea = a.IndexNumber != null ? Number(a.IndexNumber) : 9999;
+    const eb = b.IndexNumber != null ? Number(b.IndexNumber) : 9999;
+    return ea - eb;
+  });
   return list.map((ep, idx) => {
     const tag =
       ep.ParentIndexNumber != null && ep.IndexNumber != null
