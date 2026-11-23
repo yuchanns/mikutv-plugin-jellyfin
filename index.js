@@ -24,12 +24,12 @@ const COPY = {
     movieLabel: "电影",
     seriesLabel: "剧集",
     episodeLabel: "单集",
-    libraryCardTitle: "自建媒体库",
-    libraryCardDesc: "直连个人 Jellyfin 服务器，支持原生播放、HLS 转码与外挂字幕。",
-    benefitDirect: "局域网直连播放",
-    benefitHLS: "MKV 自动 HLS 适配",
-    benefitSubtitles: "外挂 WebVTT 字幕",
-    benefitResume: "播放进度同步",
+    libraryCardTitle: "Jellyfin",
+    libraryCardDesc: "自由开源的个人媒体系统。",
+    benefitDirect: "电影与剧集",
+    benefitHLS: "直连与 HLS",
+    benefitSubtitles: "外挂字幕",
+    benefitResume: "进度同步",
     connected: "已连接",
     autoQuality: "原画 / 自动",
     subtitleTrack: (i) => `字幕 ${i}`,
@@ -50,12 +50,12 @@ const COPY = {
     movieLabel: "映画",
     seriesLabel: "シリーズ",
     episodeLabel: "エピソード",
-    libraryCardTitle: "セルフホスト・ライブラリ",
-    libraryCardDesc: "個人の Jellyfin サーバーへ直接接続。ダイレクト再生・HLS 変換・字幕に対応。",
-    benefitDirect: "LAN ダイレクト再生",
-    benefitHLS: "MKV 自動 HLS 変換",
-    benefitSubtitles: "WebVTT 字幕",
-    benefitResume: "再生位置の同期",
+    libraryCardTitle: "Jellyfin",
+    libraryCardDesc: "自由でオープンソースのメディアシステム。",
+    benefitDirect: "映画とドラマ",
+    benefitHLS: "ダイレクト再生 / HLS",
+    benefitSubtitles: "字幕対応",
+    benefitResume: "進捗同期",
     connected: "接続中",
     autoQuality: "オリジナル / 自動",
     subtitleTrack: (i) => `字幕 ${i}`,
@@ -76,12 +76,12 @@ const COPY = {
     movieLabel: "Movie",
     seriesLabel: "Series",
     episodeLabel: "Episode",
-    libraryCardTitle: "Self-Hosted Media Server",
-    libraryCardDesc: "Direct access to your personal Jellyfin library with native playback, HLS remuxing, and subtitles.",
-    benefitDirect: "Direct Play on LAN",
-    benefitHLS: "Automatic MKV HLS Remux",
-    benefitSubtitles: "External WebVTT Subtitles",
-    benefitResume: "Watch Progress Sync",
+    libraryCardTitle: "Jellyfin",
+    libraryCardDesc: "The Free Software Media System.",
+    benefitDirect: "Movies & TV",
+    benefitHLS: "Direct Play & HLS",
+    benefitSubtitles: "Subtitles",
+    benefitResume: "Progress Sync",
     connected: "Connected",
     autoQuality: "Original / Auto",
     subtitleTrack: (i) => `Subtitle ${i}`,
@@ -338,17 +338,18 @@ function mapMediaItem(base, token, item) {
   return out;
 }
 
-function buildAccountObject(base, token, user, serverName, serverVersion) {
+function buildAccountObject(base, token, user, serverName, serverVersion, accountId) {
   const copy = t();
   const uid = String(user.Id || "");
-  const name = String(user.Name || "Jellyfin User");
+  const rawName = String(user.Name || "Jellyfin User");
+  const displayName = serverName && serverName.toLowerCase() !== "jellyfin" ? `${rawName} · ${serverName}` : rawName;
   const avatarURL = user.PrimaryImageTag
     ? base + "/Users/" + encodeURIComponent(uid) + "/Images/Primary" + qs({ maxWidth: 256, tag: user.PrimaryImageTag, api_key: token })
     : "";
   const badgeText = serverVersion ? `${serverName} · Jellyfin ${serverVersion}` : serverName;
   return {
-    id: uid,
-    name,
+    id: accountId || uid,
+    name: displayName,
     avatarURL,
     badge: { text: badgeText, icon: "home" },
     card: {
@@ -372,11 +373,13 @@ export async function signInWithCredentials(req) {
   const deviceId = makeDeviceId(base, username);
   let serverName = "Jellyfin";
   let serverVersion = "";
+  let serverId = "";
   try {
     const pub = await jfFetch(base, "/System/Info/Public", { deviceId });
     if (pub) {
       if (pub.ServerName) serverName = String(pub.ServerName);
       if (pub.Version) serverVersion = String(pub.Version);
+      if (pub.Id) serverId = String(pub.Id);
     }
   } catch (_) {}
 
@@ -388,16 +391,20 @@ export async function signInWithCredentials(req) {
   if (!auth || !auth.AccessToken || !auth.User || !auth.User.Id) {
     throw { code: "signIn", message: "Invalid Jellyfin credentials." };
   }
+  if (!serverId && auth.ServerId) serverId = String(auth.ServerId);
+  const uid = String(auth.User.Id);
+  const accountId = serverId ? `${serverId}:${uid}` : `${base.toLowerCase()}|${uid}`;
   const secret = {
     serverURL: base,
     accessToken: String(auth.AccessToken),
-    userId: String(auth.User.Id),
+    userId: uid,
+    accountId,
     deviceId,
     serverName,
     serverVersion,
   };
   return {
-    account: buildAccountObject(base, secret.accessToken, auth.User, serverName, serverVersion),
+    account: buildAccountObject(base, secret.accessToken, auth.User, serverName, serverVersion, accountId),
     secret,
   };
 }
@@ -420,9 +427,10 @@ export async function restoreAccount(secret) {
       if (pub.Version) serverVersion = String(pub.Version);
     }
   } catch (_) {}
-  const nextSecret = Object.assign({}, s, { serverName, serverVersion });
+  const accountId = String((secret && secret.accountId) || s.userId);
+  const nextSecret = Object.assign({}, s, { accountId, serverName, serverVersion });
   return {
-    account: buildAccountObject(s.serverURL, s.accessToken, user, serverName, serverVersion),
+    account: buildAccountObject(s.serverURL, s.accessToken, user, serverName, serverVersion, accountId),
     secret: nextSecret,
   };
 }
