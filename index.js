@@ -881,12 +881,22 @@ function appleTVDeviceProfile(hevc) {
         AudioCodec: "aac,ac3,eac3",
         Protocol: "hls",
         Context: "Streaming",
-        BreakOnNonKeyFrames: true,
+        BreakOnNonKeyFrames: false,
         SegmentLength: 6,
+        MinSegments: 2,
+        CopyTimestamps: true,
       },
     ],
     SubtitleProfiles: [
       { Format: "vtt", Method: "External" },
+      { Format: "srt", Method: "External" },
+      { Format: "subrip", Method: "External" },
+      { Format: "ass", Method: "External" },
+      { Format: "ssa", Method: "External" },
+      { Format: "pgssub", Method: "Drop" },
+      { Format: "dvdsub", Method: "Drop" },
+      { Format: "dvbsub", Method: "Drop" },
+      { Format: "pgs", Method: "Drop" },
     ],
   };
 }
@@ -944,6 +954,7 @@ export async function resolvePlayback(req) {
         UserId: s.userId,
         DeviceProfile: appleTVDeviceProfile(req && req.hevc),
         AutoOpenLiveStream: true,
+        SubtitleStreamIndex: -1,
       },
     }),
   ]);
