@@ -4,7 +4,7 @@
 
 const CLIENT_NAME = "MikuTV";
 const CLIENT_DEVICE = "Apple TV";
-const CLIENT_VERSION = "1.0.0";
+const CLIENT_VERSION = "1.0.7";
 const TICKS_PER_SECOND = 10000000;
 
 const COPY = {
@@ -31,8 +31,11 @@ const COPY = {
     benefitSubtitles: "外挂字幕",
     benefitResume: "进度同步",
     connected: "已连接",
-    autoQuality: "原画 / 自动",
+    originalQuality: "原画",
     subtitleTrack: (i) => `字幕 ${i}`,
+    audioTrack: (i) => `音轨 ${i}`,
+    chapterTitle: (i) => `第 ${i} 章`,
+    playlistFallback: "片单",
   },
   ja: {
     serverBadge: "Jellyfin サーバー",
@@ -57,8 +60,11 @@ const COPY = {
     benefitSubtitles: "字幕対応",
     benefitResume: "進捗同期",
     connected: "接続中",
-    autoQuality: "オリジナル / 自動",
+    originalQuality: "オリジナル",
     subtitleTrack: (i) => `字幕 ${i}`,
+    audioTrack: (i) => `音声 ${i}`,
+    chapterTitle: (i) => `チャプター ${i}`,
+    playlistFallback: "プレイリスト",
   },
   en: {
     serverBadge: "Jellyfin Server",
@@ -83,10 +89,21 @@ const COPY = {
     benefitSubtitles: "Subtitles",
     benefitResume: "Progress Sync",
     connected: "Connected",
-    autoQuality: "Original / Auto",
+    originalQuality: "Original",
     subtitleTrack: (i) => `Subtitle ${i}`,
+    audioTrack: (i) => `Audio ${i}`,
+    chapterTitle: (i) => `Chapter ${i}`,
+    playlistFallback: "Playlist",
   },
 };
+
+function hasHostFeature(name) {
+  try {
+    return Boolean(typeof host !== "undefined" && host && host.features && host.features[name] === true);
+  } catch (_) {
+    return false;
+  }
+}
 
 function t() {
   let lang = "en";
@@ -287,9 +304,12 @@ const SLIM_ITEM_KEYS = [
   "ParentBackdropImageTags",
   "ParentThumbItemId",
   "ParentThumbImageTag",
+  "Trickplay",
 ];
 const SLIM_USERDATA_KEYS = ["PlaybackPositionTicks", "IsFavorite", "Played", "LastPlayedDate"];
-const SLIM_STREAM_KEYS = ["Type", "Width", "Height", "VideoRange", "VideoRangeType"];
+const SLIM_STREAM_KEYS = ["Type", "Width", "Height", "BitRate", "VideoRange", "VideoRangeType"];
+const SLIM_PERSON_KEYS = ["Id", "Name", "Type", "PrimaryImageTag"];
+const SLIM_CHAPTER_KEYS = ["Name", "StartPositionTicks", "ImageTag"];
 
 function pick(src, keys) {
   const out = {};
@@ -306,11 +326,27 @@ function slimItem(item) {
   const out = pick(item, SLIM_ITEM_KEYS);
   if (item.UserData && typeof item.UserData === "object") out.UserData = pick(item.UserData, SLIM_USERDATA_KEYS);
   if (Array.isArray(item.MediaSources)) {
-    out.MediaSources = item.MediaSources.map((ms) => ({
-      MediaStreams: ms && Array.isArray(ms.MediaStreams)
-        ? ms.MediaStreams.filter((st) => st && st.Type === "Video").map((st) => pick(st, SLIM_STREAM_KEYS))
-        : [],
-    }));
+    out.MediaSources = item.MediaSources.map((ms) => {
+      const slim = {
+        Id: ms && ms.Id,
+        MediaStreams: ms && Array.isArray(ms.MediaStreams)
+          ? ms.MediaStreams.filter((st) => st && st.Type === "Video").map((st) => pick(st, SLIM_STREAM_KEYS))
+          : [],
+      };
+      if (ms && ms.Bitrate != null) slim.Bitrate = ms.Bitrate;
+      return slim;
+    });
+  }
+  if (Array.isArray(item.People) && item.People.length > 0) {
+    out.People = item.People
+      .filter((p) => p && p.Id && p.Name)
+      .slice(0, 8)
+      .map((p) => pick(p, SLIM_PERSON_KEYS));
+  }
+  if (Array.isArray(item.Chapters) && item.Chapters.length > 0) {
+    out.Chapters = item.Chapters
+      .filter((ch) => ch && ch.StartPositionTicks != null)
+      .map((ch) => pick(ch, SLIM_CHAPTER_KEYS));
   }
   return out;
 }
@@ -950,69 +986,653 @@ export async function search(req) {
   };
 }
 
+export async function searchSuggest(req) {
+  const s = requireSecret(req && req.secret);
+  const query = String((req && req.query) || "").trim();
+  if (!query) return { suggestions: [] };
+  const resp = await jfFetch(
+    s.serverURL,
+    "/Search/Hints" +
+      qs({
+        UserId: s.userId,
+        SearchTerm: query,
+        Limit: 10,
+        IncludeItemTypes: "Movie,Series,Episode,Person",
+      }),
+    { deviceId: s.deviceId, token: s.accessToken }
+  ).catch(() => null);
+  const hints = (resp && Array.isArray(resp.SearchHints)) ? resp.SearchHints : [];
+  const seen = {};
+  const suggestions = [];
+  for (let i = 0; i < hints.length; i++) {
+    const h = hints[i];
+    const name = String((h && (h.Name || h.MatchedTerm)) || "").trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen[key]) continue;
+    seen[key] = true;
+    suggestions.push(name);
+    if (suggestions.length >= 10) break;
+  }
+  return { suggestions };
+}
+
+export async function editVideo(req) {
+  const s = requireSecret(req && req.secret);
+  const refId = String((req && req.ref && req.ref.id) || "").trim();
+  const interaction = String((req && req.interaction) || "").trim();
+  if (!refId) throw { code: "plugin", message: "missing item id" };
+
+  if (interaction === "favorite") {
+    const enabled = Boolean(req && req.enabled);
+    await jfFetch(
+      s.serverURL,
+      "/Users/" + encodeURIComponent(s.userId) + "/FavoriteItems/" + encodeURIComponent(refId),
+      {
+        method: enabled ? "POST" : "DELETE",
+        deviceId: s.deviceId,
+        token: s.accessToken,
+      }
+    );
+    userDataGen(s, true);
+    return { favorite: enabled };
+  }
+  throw { code: "unsupported", message: "unsupported video interaction: " + interaction };
+}
+
+const FAVORITES_FOLDER_ID = "favorites";
+
+async function fetchUserPlaylists(s) {
+  const resp = await jfFetch(
+    s.serverURL,
+    "/Users/" +
+      encodeURIComponent(s.userId) +
+      "/Items" +
+      qs({
+        IncludeItemTypes: "Playlist",
+        Recursive: "true",
+        SortBy: "SortName",
+        SortOrder: "Ascending",
+        Fields: "ChildCount,ImageTags,PrimaryImageAspectRatio",
+      }),
+    { deviceId: s.deviceId, token: s.accessToken }
+  ).catch(() => ({ Items: [] }));
+  return (resp && Array.isArray(resp.Items)) ? resp.Items : [];
+}
+
+async function fetchPlaylistItems(s, playlistId, startIndex, limit) {
+  return jfFetch(
+    s.serverURL,
+    "/Playlists/" +
+      encodeURIComponent(playlistId) +
+      "/Items" +
+      qs({
+        UserId: s.userId,
+        StartIndex: startIndex,
+        Limit: limit,
+        Fields: ITEM_FIELDS,
+      }),
+    { deviceId: s.deviceId, token: s.accessToken }
+  );
+}
+
+function mapAccountMediaRow(s, it, removalID) {
+  const media = mapMediaItem(s.serverURL, s.accessToken, it);
+  const row = {
+    id: String(it.Id),
+    title: media.title,
+    subtitle: media.subtitle,
+    coverURL: media.coverURL,
+    ref: media.ref,
+    item: media,
+    finished: Boolean(it.UserData && it.UserData.Played),
+  };
+  if (removalID) row.removalID = String(removalID);
+  if (media.durationSeconds !== undefined) row.durationSeconds = media.durationSeconds;
+  if (media.progressSeconds !== undefined) row.progressSeconds = media.progressSeconds;
+  if (it.UserData && it.UserData.LastPlayedDate) {
+    const ts = Math.floor(Date.parse(it.UserData.LastPlayedDate) / 1000);
+    if (ts > 0) row.time = ts;
+  }
+  return row;
+}
+
 export async function readAccount(req) {
   const s = requireSecret(req && req.secret);
+  const copy = t();
   const section = String((req && req.section) || "");
+  const folder = String((req && req.folder) || "").trim();
   const startIndex = Math.max(0, parseInt(String((req && req.cursor) || "0"), 10) || 0);
   const limit = 24;
 
-  let path = "";
   if (section === "history") {
-    path =
-      "/Users/" +
-      encodeURIComponent(s.userId) +
-      "/Items/Resume" +
-      qs({ StartIndex: startIndex, Limit: limit, Recursive: "true", MediaTypes: "Video", Fields: ITEM_FIELDS });
-  } else if (section === "favorites") {
-    path =
+    // Query played & in-progress items ordered by DatePlayed descending rather
+    // than /Items/Resume, because /Items/Resume hides both finished items and
+    // items watched below Jellyfin's MinResumePct threshold.
+    const path =
       "/Users/" +
       encodeURIComponent(s.userId) +
       "/Items" +
       qs({
-        Filters: "IsFavorite",
-        IncludeItemTypes: "Movie,Series,Episode",
+        IncludeItemTypes: "Movie,Episode",
         Recursive: "true",
-        SortBy: "SortName",
+        SortBy: "DatePlayed",
+        SortOrder: "Descending",
         StartIndex: startIndex,
         Limit: limit,
         Fields: ITEM_FIELDS,
       });
-  } else {
-    return { rows: [] };
+    const resp = await jfFetch(s.serverURL, path, { deviceId: s.deviceId, token: s.accessToken });
+    const rawItems = (resp && Array.isArray(resp.Items)) ? resp.Items : [];
+    const playedItems = rawItems.filter(
+      (it) =>
+        it &&
+        it.UserData &&
+        (it.UserData.LastPlayedDate || Number(it.UserData.PlaybackPositionTicks || 0) > 0 || it.UserData.Played)
+    );
+    const rows = playedItems.map((it) => mapAccountMediaRow(s, it, it.Id));
+    const reachedUnplayedTail = playedItems.length < rawItems.length;
+    const total = Number((resp && resp.TotalRecordCount) || rawItems.length);
+    const nextCursor =
+      !reachedUnplayedTail && startIndex + rawItems.length < total ? String(startIndex + rawItems.length) : "";
+    return { rows, nextCursor };
   }
 
-  const resp = await jfFetch(s.serverURL, path, { deviceId: s.deviceId, token: s.accessToken });
-  const rawItems = (resp && Array.isArray(resp.Items)) ? resp.Items : [];
-  const total = Number((resp && resp.TotalRecordCount) || rawItems.length);
-  const rows = rawItems.map((it) => {
-    const media = mapMediaItem(s.serverURL, s.accessToken, it);
-    const row = {
-      id: String(it.Id),
-      title: media.title,
-      subtitle: media.subtitle,
-      coverURL: media.coverURL,
-      ref: media.ref,
-      item: media,
-      finished: Boolean(it.UserData && it.UserData.Played),
-    };
-    if (media.durationSeconds !== undefined) row.durationSeconds = media.durationSeconds;
-    if (media.progressSeconds !== undefined) row.progressSeconds = media.progressSeconds;
-    if (it.UserData && it.UserData.LastPlayedDate) {
-      const ts = Math.floor(Date.parse(it.UserData.LastPlayedDate) / 1000);
-      if (ts > 0) row.time = ts;
+  if (section === "favorites") {
+    if (!folder) {
+      const [favProbe, playlists] = await Promise.all([
+        jfFetch(
+          s.serverURL,
+          "/Users/" +
+            encodeURIComponent(s.userId) +
+            "/Items" +
+            qs({
+              Filters: "IsFavorite",
+              IncludeItemTypes: "Movie,Series,Episode",
+              Recursive: "true",
+              SortBy: "SortName",
+              Limit: 1,
+              Fields: "ImageTags,PrimaryImageAspectRatio",
+            }),
+          { deviceId: s.deviceId, token: s.accessToken }
+        ).catch(() => ({ Items: [], TotalRecordCount: 0 })),
+        fetchUserPlaylists(s),
+      ]);
+      const favTotal = Number((favProbe && favProbe.TotalRecordCount) || 0);
+      const favFirst = favProbe && Array.isArray(favProbe.Items) && favProbe.Items[0];
+      const rows = [
+        {
+          id: FAVORITES_FOLDER_ID,
+          title: copy.favorites,
+          count: favTotal,
+          coverURL: favFirst ? coverURLFor(s.serverURL, s.accessToken, favFirst) : "",
+          canDelete: false,
+          ref: { kind: "collection", id: FAVORITES_FOLDER_ID },
+        },
+      ];
+      for (let i = 0; i < playlists.length; i++) {
+        const pl = playlists[i];
+        if (!pl || !pl.Id) continue;
+        rows.push({
+          id: String(pl.Id),
+          title: String(pl.Name || copy.playlistFallback),
+          count: Math.max(0, Number(pl.ChildCount || 0)),
+          coverURL: coverURLFor(s.serverURL, s.accessToken, pl),
+          canDelete: true,
+          ref: { kind: "collection", id: String(pl.Id) },
+        });
+      }
+      return { rows, total: rows.length };
     }
-    return row;
-  });
-  const nextCursor = startIndex + rawItems.length < total ? String(startIndex + rawItems.length) : "";
-  return { rows, total, nextCursor };
+
+    if (folder === FAVORITES_FOLDER_ID) {
+      const resp = await jfFetch(
+        s.serverURL,
+        "/Users/" +
+          encodeURIComponent(s.userId) +
+          "/Items" +
+          qs({
+            Filters: "IsFavorite",
+            IncludeItemTypes: "Movie,Series,Episode",
+            Recursive: "true",
+            SortBy: "SortName",
+            StartIndex: startIndex,
+            Limit: limit,
+            Fields: ITEM_FIELDS,
+          }),
+        { deviceId: s.deviceId, token: s.accessToken }
+      );
+      const rawItems = (resp && Array.isArray(resp.Items)) ? resp.Items : [];
+      const total = Number((resp && resp.TotalRecordCount) || rawItems.length);
+      const rows = rawItems.map((it) => mapAccountMediaRow(s, it, it.Id));
+      const nextCursor = startIndex + rawItems.length < total ? String(startIndex + rawItems.length) : "";
+      return { rows, total, nextCursor };
+    }
+
+    const resp = await fetchPlaylistItems(s, folder, startIndex, limit);
+    const rawItems = (resp && Array.isArray(resp.Items)) ? resp.Items : [];
+    const total = Number((resp && resp.TotalRecordCount) || rawItems.length);
+    const rows = rawItems.map((it) => mapAccountMediaRow(s, it, it.PlaylistItemId || it.Id));
+    const nextCursor = startIndex + rawItems.length < total ? String(startIndex + rawItems.length) : "";
+    return { rows, total, nextCursor };
+  }
+
+  return { rows: [] };
 }
 
-function appleTVDeviceProfile(hevc) {
+export async function removeAccountItems(req) {
+  const s = requireSecret(req && req.secret);
+  const section = String((req && req.section) || "");
+  const ids = (req && Array.isArray(req.ids)) ? req.ids : [];
+  if (section !== "history" || ids.length === 0) return {};
+
+  for (let i = 0; i < ids.length; i++) {
+    const id = String(ids[i] || "").trim();
+    if (!id) continue;
+    await jfFetch(
+      s.serverURL,
+      "/Users/" + encodeURIComponent(s.userId) + "/Items/" + encodeURIComponent(id) + "/UserData",
+      {
+        method: "POST",
+        deviceId: s.deviceId,
+        token: s.accessToken,
+        body: { PlaybackPositionTicks: 0, Played: false, LastPlayedDate: null },
+      }
+    );
+  }
+  userDataGen(s, true);
+  return {};
+}
+
+export async function videoFavoriteFolders(req) {
+  const s = requireSecret(req && req.secret);
+  const copy = t();
+  const refId = String((req && req.ref && req.ref.id) || "").trim();
+  if (!refId) throw { code: "plugin", message: "missing item id" };
+
+  const [item, favProbe, playlists] = await Promise.all([
+    fetchUserItem(s, refId).catch(() => null),
+    jfFetch(
+      s.serverURL,
+      "/Users/" +
+        encodeURIComponent(s.userId) +
+        "/Items" +
+        qs({ Filters: "IsFavorite", IncludeItemTypes: "Movie,Series,Episode", Recursive: "true", Limit: 0 }),
+      { deviceId: s.deviceId, token: s.accessToken }
+    ).catch(() => ({ TotalRecordCount: 0 })),
+    fetchUserPlaylists(s),
+  ]);
+
+  const folders = [
+    {
+      id: FAVORITES_FOLDER_ID,
+      title: copy.favorites,
+      count: Math.max(0, Number((favProbe && favProbe.TotalRecordCount) || 0)),
+      selected: Boolean(item && item.UserData && item.UserData.IsFavorite),
+    },
+  ];
+
+  const limitedPlaylists = playlists.filter((pl) => pl && pl.Id).slice(0, 12);
+  const refLower = refId.toLowerCase();
+  for (let i = 0; i < limitedPlaylists.length; i += 3) {
+    const batch = limitedPlaylists.slice(i, i + 3);
+    const checks = await Promise.all(
+      batch.map(async (pl) => {
+        const resp = await jfFetch(
+          s.serverURL,
+          "/Playlists/" + encodeURIComponent(pl.Id) + "/Items" + qs({ UserId: s.userId, Limit: 200 }),
+          { deviceId: s.deviceId, token: s.accessToken }
+        ).catch(() => ({ Items: [] }));
+        const items = (resp && Array.isArray(resp.Items)) ? resp.Items : [];
+        const selected = items.some((it) => String((it && it.Id) || "").toLowerCase() === refLower);
+        return {
+          id: String(pl.Id),
+          title: String(pl.Name || copy.playlistFallback),
+          count: Math.max(0, Number(pl.ChildCount != null ? pl.ChildCount : items.length)),
+          selected,
+        };
+      })
+    );
+    for (let j = 0; j < checks.length; j++) folders.push(checks[j]);
+  }
+  return { folders };
+}
+
+export async function editVideoFavoriteFolders(req) {
+  const s = requireSecret(req && req.secret);
+  const data = (req && req.data) || req || {};
+  const refId = String((data.ref && data.ref.id) || "").trim();
+  const add = Array.isArray(data.add) ? data.add : [];
+  const remove = Array.isArray(data.remove) ? data.remove : [];
+  if (!refId) throw { code: "plugin", message: "missing item id" };
+
+  for (let i = 0; i < add.length; i++) {
+    const folderId = String(add[i] || "").trim();
+    if (!folderId) continue;
+    if (folderId === FAVORITES_FOLDER_ID) {
+      await jfFetch(
+        s.serverURL,
+        "/Users/" + encodeURIComponent(s.userId) + "/FavoriteItems/" + encodeURIComponent(refId),
+        { method: "POST", deviceId: s.deviceId, token: s.accessToken }
+      );
+    } else {
+      await jfFetch(
+        s.serverURL,
+        "/Playlists/" + encodeURIComponent(folderId) + "/Items" + qs({ Ids: refId, UserId: s.userId }),
+        { method: "POST", deviceId: s.deviceId, token: s.accessToken }
+      );
+    }
+  }
+
+  for (let i = 0; i < remove.length; i++) {
+    const folderId = String(remove[i] || "").trim();
+    if (!folderId) continue;
+    if (folderId === FAVORITES_FOLDER_ID) {
+      await jfFetch(
+        s.serverURL,
+        "/Users/" + encodeURIComponent(s.userId) + "/FavoriteItems/" + encodeURIComponent(refId),
+        { method: "DELETE", deviceId: s.deviceId, token: s.accessToken }
+      );
+    } else {
+      const resp = await jfFetch(
+        s.serverURL,
+        "/Playlists/" + encodeURIComponent(folderId) + "/Items" + qs({ UserId: s.userId, Limit: 200 }),
+        { deviceId: s.deviceId, token: s.accessToken }
+      ).catch(() => ({ Items: [] }));
+      const items = (resp && Array.isArray(resp.Items)) ? resp.Items : [];
+      const refLower = refId.toLowerCase();
+      const entryIds = items
+        .filter((it) => String((it && it.Id) || "").toLowerCase() === refLower && it.PlaylistItemId)
+        .map((it) => String(it.PlaylistItemId));
+      if (entryIds.length > 0) {
+        await jfFetch(
+          s.serverURL,
+          "/Playlists/" + encodeURIComponent(folderId) + "/Items" + qs({ EntryIds: entryIds.join(",") }),
+          { method: "DELETE", deviceId: s.deviceId, token: s.accessToken }
+        );
+      }
+    }
+  }
+  userDataGen(s, true);
+  return {};
+}
+
+export async function editFavoriteFolder(req) {
+  const s = requireSecret(req && req.secret);
+  const action = String((req && req.action) || "").trim();
+  const folder = String((req && req.folder) || "").trim();
+  const title = String((req && req.title) || "").trim();
+  const resources = (req && Array.isArray(req.resources)) ? req.resources : [];
+
+  if (action === "create") {
+    await jfFetch(s.serverURL, "/Playlists", {
+      method: "POST",
+      deviceId: s.deviceId,
+      token: s.accessToken,
+      body: { Name: title, UserId: s.userId, MediaType: "Video" },
+    });
+    userDataGen(s, true);
+    return {};
+  }
+  if (action === "update") {
+    if (!folder || folder === FAVORITES_FOLDER_ID) {
+      throw { code: "denied", message: "default favorites folder cannot be renamed" };
+    }
+    const existing = await jfFetch(
+      s.serverURL,
+      "/Users/" + encodeURIComponent(s.userId) + "/Items/" + encodeURIComponent(folder),
+      { deviceId: s.deviceId, token: s.accessToken }
+    );
+    existing.Name = title;
+    await jfFetch(s.serverURL, "/Items/" + encodeURIComponent(folder), {
+      method: "POST",
+      deviceId: s.deviceId,
+      token: s.accessToken,
+      body: existing,
+    });
+    userDataGen(s, true);
+    return {};
+  }
+  if (action === "delete") {
+    if (!folder || folder === FAVORITES_FOLDER_ID) {
+      throw { code: "denied", message: "default favorites folder cannot be deleted" };
+    }
+    await jfFetch(s.serverURL, "/Items/" + encodeURIComponent(folder), {
+      method: "DELETE",
+      deviceId: s.deviceId,
+      token: s.accessToken,
+    });
+    userDataGen(s, true);
+    return {};
+  }
+  if (action === "remove") {
+    if (folder === FAVORITES_FOLDER_ID) {
+      for (let i = 0; i < resources.length; i++) {
+        const id = String(resources[i] || "").trim();
+        if (!id) continue;
+        await jfFetch(
+          s.serverURL,
+          "/Users/" + encodeURIComponent(s.userId) + "/FavoriteItems/" + encodeURIComponent(id),
+          { method: "DELETE", deviceId: s.deviceId, token: s.accessToken }
+        );
+      }
+    } else if (folder && resources.length > 0) {
+      await jfFetch(
+        s.serverURL,
+        "/Playlists/" + encodeURIComponent(folder) + "/Items" + qs({ EntryIds: resources.join(",") }),
+        { method: "DELETE", deviceId: s.deviceId, token: s.accessToken }
+      );
+    }
+    userDataGen(s, true);
+    return {};
+  }
+  throw { code: "unsupported", message: "unsupported folder action: " + action };
+}
+
+const ORIGINAL_QUALITY_ID = "original";
+const ORIGINAL_MAX_BITRATE = 200000000;
+
+// Descending transcoding presets (highest -> lowest) aligned with MikuTV's
+// adaptive quality ladder. Filtered per item against the source's actual
+// resolution and bitrate so tiers above the source are never shown.
+const QUALITY_PRESETS = [
+  { id: "4k-40m", label: "4K · 40 Mbps", badge: "4K", tier: 2160, maxWidth: 3840, maxHeight: 2160, bitrate: 40000000 },
+  { id: "1080p-20m", label: "1080p · 20 Mbps", badge: "1080p", tier: 1080, maxWidth: 1920, maxHeight: 1080, bitrate: 20000000 },
+  { id: "1080p-10m", label: "1080p · 10 Mbps", badge: "1080p", tier: 1080, maxWidth: 1920, maxHeight: 1080, bitrate: 10000000 },
+  { id: "720p-4m", label: "720p · 4 Mbps", badge: "720p", tier: 720, maxWidth: 1280, maxHeight: 720, bitrate: 4000000 },
+  { id: "480p-2m", label: "480p · 2 Mbps", badge: "480p", tier: 480, maxWidth: 854, maxHeight: 480, bitrate: 2000000 },
+];
+
+function findQualityPreset(id) {
+  const clean = String(id || "").trim();
+  for (let i = 0; i < QUALITY_PRESETS.length; i++) {
+    if (QUALITY_PRESETS[i].id === clean) return QUALITY_PRESETS[i];
+  }
+  return null;
+}
+
+function resolutionTier(width, height) {
+  if (width >= 3400 || height >= 1900) return 2160;
+  if (width >= 1700 || height >= 950) return 1080;
+  if (width >= 1100 || height >= 650) return 720;
+  if (width > 0 || height > 0) return 480;
+  return 0;
+}
+
+function defaultBandwidthForTier(tier) {
+  if (tier >= 2160) return 45000000;
+  if (tier >= 1080) return 12000000;
+  if (tier >= 720) return 5000000;
+  return 2500000;
+}
+
+function inspectSourceVideo(ms, fallbackItem) {
+  const candidates = [];
+  if (ms && typeof ms === "object") candidates.push(ms);
+  const metaSources = fallbackItem && Array.isArray(fallbackItem.MediaSources) ? fallbackItem.MediaSources : [];
+  for (let i = 0; i < metaSources.length; i++) {
+    if (metaSources[i] && typeof metaSources[i] === "object") candidates.push(metaSources[i]);
+  }
+  let width = 0;
+  let height = 0;
+  let hdr = false;
+  let bitrate = 0;
+  for (let i = 0; i < candidates.length; i++) {
+    const src = candidates[i];
+    if (!bitrate && Number(src.Bitrate) > 0) bitrate = Math.floor(Number(src.Bitrate));
+    const streams = Array.isArray(src.MediaStreams) ? src.MediaStreams : [];
+    for (let j = 0; j < streams.length; j++) {
+      const st = streams[j];
+      if (!st || st.Type !== "Video") continue;
+      if (!width && Number(st.Width) > 0) width = Math.floor(Number(st.Width));
+      if (!height && Number(st.Height) > 0) height = Math.floor(Number(st.Height));
+      if (!bitrate && Number(st.BitRate) > 0) bitrate = Math.floor(Number(st.BitRate));
+      if (
+        st.VideoRange === "HDR" ||
+        st.VideoRangeType === "HDR10" ||
+        st.VideoRangeType === "HDR10Plus" ||
+        st.VideoRangeType === "HLG" ||
+        st.VideoRangeType === "DOVI" ||
+        st.VideoRangeType === "DOVIWithHDR10"
+      ) {
+        hdr = true;
+      }
+      break;
+    }
+    if (width || height) break;
+  }
+  const tier = resolutionTier(width, height);
+  const badge = videoQualityBadge(ms ? { MediaSources: [ms] } : fallbackItem) || videoQualityBadge(fallbackItem);
+  return {
+    width,
+    height,
+    tier,
+    hdr,
+    bitrate,
+    badge,
+    bandwidth: bitrate > 0 ? bitrate : defaultBandwidthForTier(tier),
+  };
+}
+
+function buildQualityOptions(sourceInfo, copy, allowAutoBandwidth) {
+  const autoBW = allowAutoBandwidth === undefined ? hasHostFeature("autoQualityUnderfed") : Boolean(allowAutoBandwidth);
+  const lower = [];
+  for (let i = 0; i < QUALITY_PRESETS.length; i++) {
+    const p = QUALITY_PRESETS[i];
+    if (sourceInfo.tier === 0) {
+      // Unknown resolution: only offer presets strictly below known source bitrate.
+      if (!(sourceInfo.bitrate > p.bitrate * 1.15)) continue;
+    } else {
+      // Never offer presets above the source resolution tier.
+      if (p.tier > sourceInfo.tier) continue;
+      if (p.tier === sourceInfo.tier) {
+        // Same resolution tier: only offer if it meaningfully reduces bitrate.
+        if (!(sourceInfo.bitrate > p.bitrate * 1.15)) continue;
+      } else {
+        // Strictly lower resolution tier: skip if source bitrate is already at or below preset.
+        if (sourceInfo.bitrate > 0 && p.bitrate >= sourceInfo.bitrate) continue;
+      }
+    }
+    const opt = {
+      id: p.id,
+      label: p.label,
+      badge: p.badge,
+      hdr: false,
+    };
+    // Older MikuTV hosts (v0.1.6/v0.1.7) without autoQualityUnderfed can falsely
+    // auto-downgrade fast-LAN SDR playback when lower tiers carry bandwidth.
+    // Leaving bandwidth unset on lower presets preserves manual selection and
+    // preferredQuality while keeping auto-quality safely on Original on older hosts.
+    if (autoBW) {
+      opt.bandwidth = p.bitrate;
+    }
+    lower.push(opt);
+  }
+  let origBandwidth = sourceInfo.bandwidth > 0 ? sourceInfo.bandwidth : 2500000;
+  if (lower.length > 0 && lower[0].bandwidth > 0 && origBandwidth <= lower[0].bandwidth) {
+    origBandwidth = lower[0].bandwidth + 1000000;
+  }
+  const origLabel = sourceInfo.badge ? `${sourceInfo.badge} · ${copy.originalQuality}` : copy.originalQuality;
+  const original = {
+    id: ORIGINAL_QUALITY_ID,
+    label: origLabel,
+    badge: sourceInfo.badge || "",
+    hdr: Boolean(sourceInfo.hdr),
+    bandwidth: origBandwidth,
+  };
+  return [original].concat(lower);
+}
+
+function selectPreferredPreset(preferredQuality, sourceInfo, copy) {
+  const pref = String(preferredQuality || "").trim();
+  if (!pref || pref === "4k-hdr" || pref === "4k") return null;
+  const maxTier = pref === "1080p" ? 1080 : pref === "720p" ? 720 : 0;
+  if (!maxTier) return null;
+  // Do not force transcoding if source is already at or below the preferred resolution.
+  if (sourceInfo.tier > 0 && sourceInfo.tier <= maxTier) return null;
+  const options = buildQualityOptions(sourceInfo, copy, true);
+  for (let i = 0; i < options.length; i++) {
+    const preset = findQualityPreset(options[i].id);
+    if (preset && preset.tier <= maxTier) return preset;
+  }
+  return null;
+}
+
+function appleTVDeviceProfile(hevc, preset) {
   const videoCodecs = hevc !== false ? "hevc,h264" : "h264";
+  const maxBitrate = preset ? preset.bitrate : ORIGINAL_MAX_BITRATE;
+  const transcodingProfile = {
+    Container: "mp4",
+    Type: "Video",
+    VideoCodec: videoCodecs,
+    AudioCodec: "aac,ac3,eac3",
+    Protocol: "hls",
+    Context: "Streaming",
+    BreakOnNonKeyFrames: false,
+    SegmentLength: 6,
+    MinSegments: 2,
+    CopyTimestamps: true,
+  };
+  const codecProfiles = [
+    {
+      Type: "Video",
+      Codec: "hevc",
+      Container: "mp4,m4v,mov",
+      Conditions: [
+        {
+          Condition: "EqualsAny",
+          Property: "VideoCodecTag",
+          Value: "hvc1|dvh1|dvhe",
+          IsRequired: false,
+        },
+      ],
+    },
+  ];
+  if (preset) {
+    const resolutionConditions = [
+      {
+        Condition: "LessThanEqual",
+        Property: "Width",
+        Value: String(preset.maxWidth),
+        IsRequired: false,
+      },
+      {
+        Condition: "LessThanEqual",
+        Property: "Height",
+        Value: String(preset.maxHeight),
+        IsRequired: false,
+      },
+    ];
+    transcodingProfile.Conditions = resolutionConditions;
+    codecProfiles.push({
+      Type: "Video",
+      Conditions: resolutionConditions,
+    });
+  }
   return {
     Name: "MikuTV Apple TV",
-    MaxStreamingBitrate: 200000000,
-    MaxStaticBitrate: 200000000,
+    MaxStreamingBitrate: maxBitrate,
+    MaxStaticBitrate: maxBitrate,
     DirectPlayProfiles: [
       {
         Container: "mp4,m4v,mov",
@@ -1021,35 +1641,8 @@ function appleTVDeviceProfile(hevc) {
         AudioCodec: "aac,mp3,ac3,eac3,alac,flac",
       },
     ],
-    TranscodingProfiles: [
-      {
-        Container: "mp4",
-        Type: "Video",
-        VideoCodec: videoCodecs,
-        AudioCodec: "aac,ac3,eac3",
-        Protocol: "hls",
-        Context: "Streaming",
-        BreakOnNonKeyFrames: false,
-        SegmentLength: 6,
-        MinSegments: 2,
-        CopyTimestamps: true,
-      },
-    ],
-    CodecProfiles: [
-      {
-        Type: "Video",
-        Codec: "hevc",
-        Container: "mp4,m4v,mov",
-        Conditions: [
-          {
-            Condition: "EqualsAny",
-            Property: "VideoCodecTag",
-            Value: "hvc1|dvh1|dvhe",
-            IsRequired: false,
-          },
-        ],
-      },
-    ],
+    TranscodingProfiles: [transcodingProfile],
+    CodecProfiles: codecProfiles,
     SubtitleProfiles: [
       { Format: "vtt", Method: "External" },
       { Format: "srt", Method: "External" },
@@ -1072,8 +1665,8 @@ function ensureQueryToken(fullURL, token) {
 
 // Strip server-side subtitle burn-in parameters from Jellyfin HLS URLs.
 // Text subtitles are delivered externally as WebVTT via readSubtitles, while
-// bitmap subtitles (PGS/VobSub/DVBSub) would otherwise force full CPU video
-// transcoding instead of lossless video stream copy.
+// Blu-ray PGS subtitles are rendered natively client-side by MikuTV so video
+// remains lossless stream copy instead of forcing CPU burn-in.
 function stripSubtitleBurnIn(rawURL) {
   if (!rawURL) return "";
   const qIdx = rawURL.indexOf("?");
@@ -1099,10 +1692,148 @@ function stripSubtitleBurnIn(rawURL) {
   return kept.length > 0 ? base + "?" + kept.join("&") : base;
 }
 
-function requestPlaybackInfo(s, playId, hevc, mediaSourceId) {
+function parseAudioTrackIndex(raw) {
+  const clean = String(raw || "").trim();
+  if (!clean) return null;
+  const m = clean.match(/^(?:audio-)?(\d+)$/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function extractAudioTracks(mediaStreams, copy) {
+  const tracks = [];
+  let counter = 1;
+  for (let i = 0; i < mediaStreams.length; i++) {
+    const st = mediaStreams[i];
+    if (!st || st.Type !== "Audio") continue;
+    const idx = st.Index != null ? Number(st.Index) : i;
+    if (!Number.isFinite(idx) || idx < 0) continue;
+    const parts = [];
+    if (st.DisplayTitle) {
+      parts.push(String(st.DisplayTitle).trim());
+    } else {
+      if (st.Title) parts.push(String(st.Title).trim());
+      if (st.Language) parts.push(String(st.Language).trim());
+      if (st.Codec) parts.push(String(st.Codec).toUpperCase().trim());
+      if (st.ChannelLayout) parts.push(String(st.ChannelLayout).trim());
+    }
+    const label = (parts.filter(Boolean).join(" · ") || copy.audioTrack(counter)).slice(0, 128);
+    const track = {
+      id: "audio-" + idx,
+      label,
+      language: String(st.Language || "").trim().slice(0, 64),
+      codec: String(st.Codec || "").toLowerCase().trim().slice(0, 64),
+      default: Boolean(st.IsDefault),
+      index: idx,
+    };
+    const bw = Math.floor(Number(st.BitRate || 0));
+    if (bw > 0) track.bandwidth = bw;
+    tracks.push(track);
+    counter++;
+  }
+  return tracks;
+}
+
+function isPGSSubtitleStream(st) {
+  const codec = String((st && st.Codec) || "").toLowerCase().trim();
+  return codec === "pgssub" || codec === "pgs" || codec === "hdmv_pgs_subtitle";
+}
+
+function buildChapters(s, playId, itemMeta, copy) {
+  const raw = itemMeta && Array.isArray(itemMeta.Chapters) ? itemMeta.Chapters : [];
+  if (raw.length === 0) return [];
+  const chapters = [];
+  let lastStart = -1;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (!ch || typeof ch !== "object") continue;
+    const ticks = Number(ch.StartPositionTicks);
+    if (!Number.isFinite(ticks) || ticks < 0) continue;
+    const start = Math.round((ticks / TICKS_PER_SECOND) * 1000) / 1000;
+    if (start <= lastStart) continue;
+    lastStart = start;
+    const title = String(ch.Name || "").trim() || copy.chapterTitle(chapters.length + 1);
+    const entry = { title, start };
+    if (ch.ImageTag) {
+      entry.imageURL =
+        s.serverURL +
+        "/Items/" +
+        encodeURIComponent(playId) +
+        "/Images/Chapter/" +
+        i +
+        qs({ tag: ch.ImageTag, maxWidth: 480, quality: 85, api_key: s.accessToken });
+    }
+    chapters.push(entry);
+  }
+  return chapters;
+}
+
+function buildThumbnails(s, playId, msId, itemMeta) {
+  const tp = itemMeta && itemMeta.Trickplay;
+  if (!tp || typeof tp !== "object") return null;
+  let byWidth = tp[msId];
+  if (!byWidth || typeof byWidth !== "object") {
+    const keys = Object.keys(tp);
+    if (keys.length === 0) return null;
+    byWidth = tp[keys[0]];
+  }
+  if (!byWidth || typeof byWidth !== "object") return null;
+  const widthKeys = Object.keys(byWidth)
+    .map((k) => ({ key: k, width: parseInt(k, 10) || 0, info: byWidth[k] }))
+    .filter((entry) => entry.info && typeof entry.info === "object" && entry.width > 0)
+    .sort((a, b) => a.width - b.width);
+  if (widthKeys.length === 0) return null;
+  let chosen = widthKeys.find((e) => e.width === 320);
+  if (!chosen) {
+    const under480 = widthKeys.filter((e) => e.width <= 480);
+    chosen = under480.length > 0 ? under480[under480.length - 1] : widthKeys[0];
+  }
+  const info = chosen.info;
+  const width = Math.floor(Number(info.Width || chosen.width));
+  const height = Math.floor(Number(info.Height || 0));
+  const columns = Math.floor(Number(info.TileWidth || 0));
+  const rows = Math.floor(Number(info.TileHeight || 0));
+  const count = Math.floor(Number(info.ThumbnailCount || 0));
+  const intervalMs = Number(info.Interval || 0);
+  if (width < 1 || height < 1 || columns < 1 || rows < 1 || count < 1 || !(intervalMs > 0)) {
+    return null;
+  }
+  const perSheet = columns * rows;
+  const sheetCount = Math.ceil(count / perSheet);
+  if (sheetCount < 1 || sheetCount > 240) return null;
+  const images = [];
+  for (let i = 0; i < sheetCount; i++) {
+    images.push(
+      s.serverURL +
+        "/Videos/" +
+        encodeURIComponent(playId) +
+        "/Trickplay/" +
+        width +
+        "/" +
+        i +
+        ".jpg" +
+        qs({ mediaSourceId: msId, api_key: s.accessToken })
+    );
+  }
+  const times = [];
+  for (let i = 0; i < count; i++) {
+    times.push((i * intervalMs) / 1000);
+  }
+  return { images, times, columns, rows, width, height };
+}
+
+const TTL_PLAY_SESSION = 21600;
+
+function playSessionKey(s, itemId) {
+  return hasCache() ? CACHE_PREFIX + "playsess:" + cacheScope(s) + "|" + itemId : "";
+}
+
+function requestPlaybackInfo(s, playId, hevc, mediaSourceId, preset, audioStreamIndex, disableDirectPlay) {
   const body = {
     UserId: s.userId,
-    DeviceProfile: appleTVDeviceProfile(hevc),
+    MaxStreamingBitrate: preset ? preset.bitrate : ORIGINAL_MAX_BITRATE,
+    DeviceProfile: appleTVDeviceProfile(hevc, preset),
     AutoOpenLiveStream: true,
     SubtitleStreamIndex: -1,
     AlwaysBurnInSubtitleWhenTranscoding: false,
@@ -1110,12 +1841,30 @@ function requestPlaybackInfo(s, playId, hevc, mediaSourceId) {
   if (mediaSourceId) {
     body.MediaSourceId = mediaSourceId;
   }
+  if (audioStreamIndex != null) {
+    body.AudioStreamIndex = audioStreamIndex;
+  }
+  if (disableDirectPlay) {
+    body.EnableDirectPlay = false;
+    body.EnableDirectStream = true;
+    body.EnableTranscoding = true;
+  }
   return jfFetch(s.serverURL, "/Items/" + encodeURIComponent(playId) + "/PlaybackInfo" + qs({ UserId: s.userId }), {
     method: "POST",
     deviceId: s.deviceId,
     token: s.accessToken,
     body,
   });
+}
+
+function pickMediaSource(resp, msId) {
+  const list = (resp && Array.isArray(resp.MediaSources)) ? resp.MediaSources : [];
+  if (list.length === 0) return null;
+  if (msId) {
+    const matched = list.find((src) => String((src && src.Id) || "").toLowerCase() === msId.toLowerCase());
+    if (matched) return matched;
+  }
+  return list[0];
 }
 
 export async function resolvePlayback(req) {
@@ -1152,35 +1901,141 @@ export async function resolvePlayback(req) {
     episodes = await fetchSeriesEpisodes(s, ref.id).catch(() => []);
   }
 
-  let [itemMeta, playbackInfo] = await Promise.all([
-    fetchUserItem(s, playId).catch(() => null),
-    requestPlaybackInfo(s, playId, req && req.hevc, playId),
-  ]);
+  const reqQuality = String((req && req.quality) || "").trim();
+  const prefQuality = String((req && req.preferredQuality) || "").trim();
+  let requestedAudioIndex = parseAudioTrackIndex(req && req.audioTrack);
+  let activePreset =
+    reqQuality && reqQuality !== ORIGINAL_QUALITY_ID && reqQuality !== "auto"
+      ? findQualityPreset(reqQuality)
+      : null;
+
+  let itemMeta = null;
+  let playbackInfo = null;
+  if (!reqQuality && (prefQuality === "1080p" || prefQuality === "720p")) {
+    itemMeta = await fetchUserItem(s, playId).catch(() => null);
+    if (itemMeta) {
+      activePreset = selectPreferredPreset(prefQuality, inspectSourceVideo(null, itemMeta), copy);
+    }
+    playbackInfo = await requestPlaybackInfo(s, playId, req && req.hevc, playId, activePreset, requestedAudioIndex, false);
+  } else {
+    [itemMeta, playbackInfo] = await Promise.all([
+      fetchUserItem(s, playId).catch(() => null),
+      requestPlaybackInfo(s, playId, req && req.hevc, playId, activePreset, requestedAudioIndex, false),
+    ]);
+  }
 
   if (episodes.length === 0 && itemMeta && itemMeta.Type === "Episode" && itemMeta.SeriesId) {
     episodes = await fetchSeriesEpisodes(s, itemMeta.SeriesId).catch(() => []);
   }
 
-  let sources = (playbackInfo && Array.isArray(playbackInfo.MediaSources)) ? playbackInfo.MediaSources : [];
-  if (sources.length === 0) {
+  let ms = pickMediaSource(playbackInfo, "");
+  if (!ms) {
     throw { code: "plugin", message: "No playable media sources returned by Jellyfin." };
   }
-  let ms = sources[0];
   let msId = String(ms.Id || playId);
+  let playSessionId = String((playbackInfo && playbackInfo.PlaySessionId) || "").trim();
 
-  // Jellyfin MediaInfoHelper only applies SubtitleStreamIndex when MediaSourceId
-  // matches the resolved media source ID. Multi-version items may return a
-  // MediaSource.Id that differs from playId, so re-request once with the actual
-  // MediaSourceId to avoid default graphical subtitles forcing CPU video burn-in.
-  if (msId && msId.toLowerCase() !== playId.toLowerCase() && !ms.SupportsDirectPlay) {
-    const refined = await requestPlaybackInfo(s, playId, req && req.hevc, msId).catch(() => null);
-    const refinedSources = (refined && Array.isArray(refined.MediaSources)) ? refined.MediaSources : [];
-    if (refinedSources.length > 0) {
-      const matched = refinedSources.find((src) => String(src && src.Id || "").toLowerCase() === msId.toLowerCase());
-      ms = matched || refinedSources[0];
+  // Validate requestedAudioIndex against actual audio streams on this media source.
+  let audioEntries = extractAudioTracks(Array.isArray(ms.MediaStreams) ? ms.MediaStreams : [], copy);
+  if (requestedAudioIndex != null && !audioEntries.some((a) => a.index === requestedAudioIndex)) {
+    requestedAudioIndex = null;
+  }
+
+  const defaultAudioEntry = audioEntries.find((a) => a.default) || audioEntries[0] || null;
+  const defaultAudioIndex =
+    ms.DefaultAudioStreamIndex != null
+      ? Number(ms.DefaultAudioStreamIndex)
+      : defaultAudioEntry
+        ? defaultAudioEntry.index
+        : null;
+  const needsRemuxForAudio =
+    requestedAudioIndex != null &&
+    ms.SupportsDirectPlay &&
+    defaultAudioIndex != null &&
+    requestedAudioIndex !== defaultAudioIndex;
+
+  // Jellyfin MediaInfoHelper only applies SubtitleStreamIndex / AudioStreamIndex
+  // when MediaSourceId matches the resolved media source ID, and Static DirectPlay
+  // ignores AudioStreamIndex when switching away from the container's default track.
+  if (needsRemuxForAudio || (msId && msId.toLowerCase() !== playId.toLowerCase() && !ms.SupportsDirectPlay)) {
+    const refined = await requestPlaybackInfo(
+      s,
+      playId,
+      req && req.hevc,
+      msId,
+      activePreset,
+      requestedAudioIndex,
+      needsRemuxForAudio
+    ).catch(() => null);
+    const matched = pickMediaSource(refined, msId);
+    if (matched) {
+      ms = matched;
       msId = String(ms.Id || msId);
+      if (refined && refined.PlaySessionId) playSessionId = String(refined.PlaySessionId).trim();
     }
   }
+
+  const sourceInfo = inspectSourceVideo(ms, itemMeta);
+
+  // If preferredQuality was requested but itemMeta was unavailable before the
+  // initial PlaybackInfo call, apply the preferred cap now using ms metadata.
+  if (!reqQuality && !activePreset && (prefQuality === "1080p" || prefQuality === "720p")) {
+    const deferred = selectPreferredPreset(prefQuality, sourceInfo, copy);
+    if (deferred) {
+      activePreset = deferred;
+      const capped = await requestPlaybackInfo(
+        s,
+        playId,
+        req && req.hevc,
+        msId,
+        activePreset,
+        requestedAudioIndex,
+        needsRemuxForAudio
+      ).catch(() => null);
+      const matched = pickMediaSource(capped, msId);
+      if (matched) {
+        ms = matched;
+        msId = String(ms.Id || msId);
+        if (capped && capped.PlaySessionId) playSessionId = String(capped.PlaySessionId).trim();
+      }
+    }
+  }
+
+  const qualities = buildQualityOptions(sourceInfo, copy);
+
+  // If the requested preset is above or equal to this item's actual quality,
+  // fall back to Original so we never expose or force upscaled/redundant tiers.
+  if (activePreset && !qualities.some((q) => q.id === activePreset.id)) {
+    activePreset = null;
+    if (!ms.SupportsDirectPlay) {
+      const origResp = await requestPlaybackInfo(
+        s,
+        playId,
+        req && req.hevc,
+        msId,
+        null,
+        requestedAudioIndex,
+        needsRemuxForAudio
+      ).catch(() => null);
+      const matched = pickMediaSource(origResp, msId);
+      if (matched) {
+        ms = matched;
+        msId = String(ms.Id || msId);
+        if (origResp && origResp.PlaySessionId) playSessionId = String(origResp.PlaySessionId).trim();
+      }
+    }
+  }
+
+  const activeQualityId = activePreset ? activePreset.id : ORIGINAL_QUALITY_ID;
+  const mediaStreams = Array.isArray(ms.MediaStreams) ? ms.MediaStreams : [];
+  audioEntries = extractAudioTracks(mediaStreams, copy);
+  const activeAudioEntry =
+    (requestedAudioIndex != null && audioEntries.find((a) => a.index === requestedAudioIndex)) ||
+    (ms.DefaultAudioStreamIndex != null && audioEntries.find((a) => a.index === Number(ms.DefaultAudioStreamIndex))) ||
+    audioEntries.find((a) => a.default) ||
+    audioEntries[0] ||
+    null;
+  const activeAudioIndex = activeAudioEntry ? activeAudioEntry.index : null;
 
   const containerParts = String(ms.Container || "mp4").toLowerCase().split(",").map((c) => c.replace(/[^a-z0-9]/g, "")).filter(Boolean);
   const container = containerParts.indexOf("mp4") >= 0 ? "mp4" : (containerParts[0] || "mp4");
@@ -1188,9 +2043,11 @@ export async function resolvePlayback(req) {
   let streamFormat = "direct";
   let streamURL = "";
   let contentType = "video/mp4";
+  let playMethod = "DirectPlay";
 
-  if (ms.SupportsDirectPlay) {
+  if (ms.SupportsDirectPlay && !needsRemuxForAudio) {
     streamFormat = "direct";
+    playMethod = "DirectPlay";
     streamURL =
       s.serverURL +
       "/Videos/" +
@@ -1201,6 +2058,7 @@ export async function resolvePlayback(req) {
     contentType = container === "mov" ? "video/quicktime" : "video/mp4";
   } else if (ms.TranscodingUrl) {
     streamFormat = "hls";
+    playMethod = "Transcode";
     const rawTranscodeURL = ms.TranscodingUrl.startsWith("http")
       ? ms.TranscodingUrl
       : s.serverURL + ms.TranscodingUrl;
@@ -1209,69 +2067,120 @@ export async function resolvePlayback(req) {
   } else {
     // Fallback to Jellyfin HLS master playlist.
     streamFormat = "hls";
+    playMethod = "DirectStream";
+    const fallbackParams = {
+      MediaSourceId: msId,
+      DeviceId: s.deviceId,
+      VideoCodec: req && req.hevc === false ? "h264" : "hevc,h264",
+      AudioCodec: "aac,ac3,eac3",
+      SegmentContainer: "mp4",
+      api_key: s.accessToken,
+    };
+    if (activeAudioIndex != null) {
+      fallbackParams.AudioStreamIndex = activeAudioIndex;
+    }
+    if (activePreset) {
+      fallbackParams.VideoBitrate = activePreset.bitrate;
+      fallbackParams.MaxWidth = activePreset.maxWidth;
+      fallbackParams.MaxHeight = activePreset.maxHeight;
+    }
     streamURL =
       s.serverURL +
       "/Videos/" +
       encodeURIComponent(playId) +
       "/master.m3u8" +
-      qs({
-        MediaSourceId: msId,
-        DeviceId: s.deviceId,
-        VideoCodec: "hevc,h264",
-        AudioCodec: "aac,ac3,eac3",
-        SegmentContainer: "mp4",
-        api_key: s.accessToken,
-      });
+      qs(fallbackParams);
     contentType = "application/vnd.apple.mpegurl";
   }
 
-  // Extract text subtitles as WebVTT external tracks.
+  // Extract text subtitles as WebVTT external tracks and Blu-ray PGS bitmap
+  // subtitles when the host supports native client-side PGS decoding.
+  const allowPGS = hasHostFeature("pgsSubtitles");
   const subtitles = [];
-  const mediaStreams = Array.isArray(ms.MediaStreams) ? ms.MediaStreams : [];
   let subCounter = 1;
   for (let i = 0; i < mediaStreams.length; i++) {
     const st = mediaStreams[i];
-    if (st.Type !== "Subtitle") continue;
-    if (!st.IsTextSubtitleStream) continue;
+    if (!st || st.Type !== "Subtitle") continue;
     const subIdx = st.Index != null ? st.Index : i;
-    const subURL =
-      s.serverURL +
-      "/Videos/" +
-      encodeURIComponent(playId) +
-      "/" +
-      encodeURIComponent(msId) +
-      "/Subtitles/" +
-      subIdx +
-      "/0/Stream.vtt" +
-      qs({ api_key: s.accessToken });
-    const label = String(st.DisplayTitle || st.Title || st.Language || copy.subtitleTrack(subCounter)).trim();
-    subtitles.push({
-      id: "sub-" + subIdx,
-      label: label || copy.subtitleTrack(subCounter),
-      language: String(st.Language || "").trim(),
-      default: Boolean(st.IsDefault),
-      resource: { urls: [subURL] },
-    });
-    subCounter++;
+    const label = String(st.DisplayTitle || st.Title || st.Language || copy.subtitleTrack(subCounter)).trim().slice(0, 128);
+    const language = String(st.Language || "").trim().slice(0, 64);
+    if (st.IsTextSubtitleStream) {
+      const subURL =
+        s.serverURL +
+        "/Videos/" +
+        encodeURIComponent(playId) +
+        "/" +
+        encodeURIComponent(msId) +
+        "/Subtitles/" +
+        subIdx +
+        "/0/Stream.vtt" +
+        qs({ api_key: s.accessToken });
+      subtitles.push({
+        id: "sub-" + subIdx,
+        label: label || copy.subtitleTrack(subCounter),
+        language,
+        default: Boolean(st.IsDefault),
+        resource: { urls: [subURL] },
+      });
+      subCounter++;
+    } else if (allowPGS && isPGSSubtitleStream(st)) {
+      const subURL =
+        s.serverURL +
+        "/Videos/" +
+        encodeURIComponent(playId) +
+        "/" +
+        encodeURIComponent(msId) +
+        "/Subtitles/" +
+        subIdx +
+        "/0/Stream.pgssub" +
+        qs({ api_key: s.accessToken });
+      subtitles.push({
+        id: "sub-" + subIdx,
+        label: label || copy.subtitleTrack(subCounter),
+        language,
+        codec: "pgssub",
+        contentType: "application/x-pgs",
+        default: Boolean(st.IsDefault),
+        resource: { urls: [subURL] },
+      });
+      subCounter++;
+    }
   }
 
-  const badge = videoQualityBadge(itemMeta || { MediaSources: [ms] });
-  const duration = Number(ticksToSeconds((itemMeta && itemMeta.RunTimeTicks) || ms.RunTimeTicks) || 0);
-  const resumeSeconds = Number(ticksToSeconds(itemMeta && itemMeta.UserData && itemMeta.UserData.PlaybackPositionTicks) || 0);
+  const durationTicks = Number((itemMeta && itemMeta.RunTimeTicks) || ms.RunTimeTicks || 0);
+  const duration = Number(ticksToSeconds(durationTicks) || 0);
+  const resumeTicks = Number((itemMeta && itemMeta.UserData && itemMeta.UserData.PlaybackPositionTicks) || 0);
+  const resumeSeconds = Number(ticksToSeconds(resumeTicks) || 0);
+  const chapters = buildChapters(s, playId, itemMeta, copy);
+  const thumbnails = buildThumbnails(s, playId, msId, itemMeta);
+
+  // Cache play session metadata without firing /Sessions/Playing yet so hover
+  // inline-previews never pollute Jellyfin active sessions or watch history.
+  // reportPlayback fires /Sessions/Playing lazily on the first real playback report.
+  const sessKey = playSessionKey(s, playId);
+  if (sessKey) {
+    cacheSetJSON(
+      sessKey,
+      {
+        itemId: playId,
+        mediaSourceId: msId,
+        playSessionId,
+        playMethod,
+        durationTicks,
+        audioStreamIndex: activeAudioIndex,
+        started: false,
+      },
+      TTL_PLAY_SESSION
+    );
+  }
 
   const plan = {
     itemID: playId,
     duration,
     resumeSeconds: duration > 0 && resumeSeconds < duration - 5 ? resumeSeconds : 0,
     access: "granted",
-    quality: "auto",
-    qualities: [
-      {
-        id: "auto",
-        label: badge ? `${badge} · ${copy.autoQuality}` : copy.autoQuality,
-        badge: badge || "",
-      },
-    ],
+    quality: activeQualityId,
+    qualities,
     streams: [
       {
         format: streamFormat,
@@ -1284,8 +2193,30 @@ export async function resolvePlayback(req) {
     subtitles,
     episodes,
   };
+  if (hasHostFeature("planAudioTracks") && audioEntries.length > 0 && activeAudioEntry) {
+    plan.audioTrack = activeAudioEntry.id;
+    plan.audioTracks = audioEntries.map((a) => {
+      const out = {
+        id: a.id,
+        label: a.label,
+        language: a.language,
+        codec: a.codec,
+        default: a.default,
+      };
+      if (a.bandwidth > 0) out.bandwidth = a.bandwidth;
+      return out;
+    });
+  }
+  if (chapters.length > 0) {
+    plan.chapters = chapters;
+  }
+  if (thumbnails) {
+    plan.thumbnails = thumbnails;
+  }
   if (req && req.partID) {
     plan.partID = String(req.partID);
+  } else if (ref.kind === "series" && playId) {
+    plan.partID = playId;
   }
   return plan;
 }
@@ -1339,10 +2270,14 @@ function parseWebVTT(raw) {
 
 export async function readSubtitles(req) {
   const s = requireSecret(req && req.secret);
-  const urls = req && req.track && req.track.resource && Array.isArray(req.track.resource.urls)
-    ? req.track.resource.urls
-    : [];
+  const track = (req && req.track) || {};
+  const urls = track.resource && Array.isArray(track.resource.urls) ? track.resource.urls : [];
   if (urls.length === 0) return { cues: [] };
+  const codec = String(track.codec || "").toLowerCase().trim();
+  const contentType = String(track.contentType || "").toLowerCase().trim();
+  if (codec === "pgssub" || codec === "pgs" || contentType === "application/x-pgs" || /\.pgssub(\?|$)/i.test(urls[0])) {
+    return { cues: [] };
+  }
   let resp;
   try {
     resp = await fetch(urls[0], {
@@ -1365,19 +2300,81 @@ export async function reportPlayback(req) {
   const data = (req && req.data) || {};
   const itemId = String(data.itemID || data.partID || (data.ref && data.ref.id) || "").trim();
   if (!itemId) return {};
-  const ticks = Math.max(0, Math.floor(Number(data.seconds || 0) * TICKS_PER_SECOND));
-  try {
-    await jfFetch(s.serverURL, "/Sessions/Playing/Progress", {
-      method: "POST",
-      deviceId: s.deviceId,
-      token: s.accessToken,
-      body: {
-        ItemId: itemId,
-        PositionTicks: ticks,
-        IsPaused: false,
-      },
-    });
-  } catch (_) {}
+  const sessKey = playSessionKey(s, itemId);
+  const sess = sessKey ? cacheGetJSON(sessKey) : null;
+  let ticks = Math.max(0, Math.floor(Number(data.seconds || 0) * TICKS_PER_SECOND));
+  const finished = Boolean(data.finished);
+  const stopped = Boolean(data.stopped);
+  if (finished && sess && sess.durationTicks > 0 && ticks < sess.durationTicks) {
+    ticks = sess.durationTicks;
+  }
+
+  const body = {
+    ItemId: itemId,
+    PositionTicks: ticks,
+    IsPaused: false,
+    CanSeek: true,
+  };
+  if (sess) {
+    if (sess.mediaSourceId) body.MediaSourceId = sess.mediaSourceId;
+    if (sess.playSessionId) body.PlaySessionId = sess.playSessionId;
+    if (sess.playMethod) body.PlayMethod = sess.playMethod;
+    if (sess.audioStreamIndex != null) body.AudioStreamIndex = sess.audioStreamIndex;
+  }
+
+  if (!sess || !sess.started) {
+    try {
+      await jfFetch(s.serverURL, "/Sessions/Playing", {
+        method: "POST",
+        deviceId: s.deviceId,
+        token: s.accessToken,
+        body,
+      });
+    } catch (_) {}
+    if (sessKey && sess) {
+      sess.started = true;
+      cacheSetJSON(sessKey, sess, TTL_PLAY_SESSION);
+    }
+  }
+
+  if (finished || stopped) {
+    try {
+      await jfFetch(s.serverURL, "/Sessions/Playing/Stopped", {
+        method: "POST",
+        deviceId: s.deviceId,
+        token: s.accessToken,
+        body,
+      });
+    } catch (_) {}
+    if (finished) {
+      try {
+        await jfFetch(
+          s.serverURL,
+          "/Users/" + encodeURIComponent(s.userId) + "/PlayedItems/" + encodeURIComponent(itemId),
+          {
+            method: "POST",
+            deviceId: s.deviceId,
+            token: s.accessToken,
+          }
+        );
+      } catch (_) {}
+    }
+    if (sessKey && hasCache() && typeof host.cache.delete === "function") {
+      try {
+        host.cache.delete(sessKey);
+      } catch (_) {}
+    }
+  } else {
+    try {
+      await jfFetch(s.serverURL, "/Sessions/Playing/Progress", {
+        method: "POST",
+        deviceId: s.deviceId,
+        token: s.accessToken,
+        body,
+      });
+    } catch (_) {}
+  }
+
   // Progress changes UserData on this item, its series and any list showing it.
   userDataGen(s, true);
   return {};
