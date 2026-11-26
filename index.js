@@ -1011,8 +1011,8 @@ function appleTVDeviceProfile(hevc) {
   const videoCodecs = hevc !== false ? "hevc,h264" : "h264";
   return {
     Name: "MikuTV Apple TV",
-    MaxStreamingBitrate: 120000000,
-    MaxStaticBitrate: 120000000,
+    MaxStreamingBitrate: 200000000,
+    MaxStaticBitrate: 200000000,
     DirectPlayProfiles: [
       {
         Container: "mp4,m4v,mov",
@@ -1035,6 +1035,21 @@ function appleTVDeviceProfile(hevc) {
         CopyTimestamps: true,
       },
     ],
+    CodecProfiles: [
+      {
+        Type: "Video",
+        Codec: "hevc",
+        Container: "mp4,m4v,mov",
+        Conditions: [
+          {
+            Condition: "EqualsAny",
+            Property: "VideoCodecTag",
+            Value: "hvc1|dvh1|dvhe",
+            IsRequired: false,
+          },
+        ],
+      },
+    ],
     SubtitleProfiles: [
       { Format: "vtt", Method: "External" },
       { Format: "srt", Method: "External" },
@@ -1053,6 +1068,54 @@ function ensureQueryToken(fullURL, token) {
   if (!fullURL) return "";
   if (/[?&](api_key|ApiKey)=/i.test(fullURL)) return fullURL;
   return fullURL + (fullURL.indexOf("?") >= 0 ? "&" : "?") + "api_key=" + encodeURIComponent(token);
+}
+
+// Strip server-side subtitle burn-in parameters from Jellyfin HLS URLs.
+// Text subtitles are delivered externally as WebVTT via readSubtitles, while
+// bitmap subtitles (PGS/VobSub/DVBSub) would otherwise force full CPU video
+// transcoding instead of lossless video stream copy.
+function stripSubtitleBurnIn(rawURL) {
+  if (!rawURL) return "";
+  const qIdx = rawURL.indexOf("?");
+  if (qIdx < 0) return rawURL;
+  const base = rawURL.slice(0, qIdx);
+  const parts = rawURL.slice(qIdx + 1).split("&");
+  const kept = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part) continue;
+    const eqIdx = part.indexOf("=");
+    const key = (eqIdx >= 0 ? part.slice(0, eqIdx) : part).toLowerCase();
+    if (
+      key === "subtitlestreamindex" ||
+      key === "subtitlemethod" ||
+      key === "subtitlecodec" ||
+      key === "alwaysburninsubtitlewhentranscoding"
+    ) {
+      continue;
+    }
+    kept.push(part);
+  }
+  return kept.length > 0 ? base + "?" + kept.join("&") : base;
+}
+
+function requestPlaybackInfo(s, playId, hevc, mediaSourceId) {
+  const body = {
+    UserId: s.userId,
+    DeviceProfile: appleTVDeviceProfile(hevc),
+    AutoOpenLiveStream: true,
+    SubtitleStreamIndex: -1,
+    AlwaysBurnInSubtitleWhenTranscoding: false,
+  };
+  if (mediaSourceId) {
+    body.MediaSourceId = mediaSourceId;
+  }
+  return jfFetch(s.serverURL, "/Items/" + encodeURIComponent(playId) + "/PlaybackInfo" + qs({ UserId: s.userId }), {
+    method: "POST",
+    deviceId: s.deviceId,
+    token: s.accessToken,
+    body,
+  });
 }
 
 export async function resolvePlayback(req) {
@@ -1089,31 +1152,36 @@ export async function resolvePlayback(req) {
     episodes = await fetchSeriesEpisodes(s, ref.id).catch(() => []);
   }
 
-  const [itemMeta, playbackInfo] = await Promise.all([
+  let [itemMeta, playbackInfo] = await Promise.all([
     fetchUserItem(s, playId).catch(() => null),
-    jfFetch(s.serverURL, "/Items/" + encodeURIComponent(playId) + "/PlaybackInfo" + qs({ UserId: s.userId }), {
-      method: "POST",
-      deviceId: s.deviceId,
-      token: s.accessToken,
-      body: {
-        UserId: s.userId,
-        DeviceProfile: appleTVDeviceProfile(req && req.hevc),
-        AutoOpenLiveStream: true,
-        SubtitleStreamIndex: -1,
-      },
-    }),
+    requestPlaybackInfo(s, playId, req && req.hevc, playId),
   ]);
 
   if (episodes.length === 0 && itemMeta && itemMeta.Type === "Episode" && itemMeta.SeriesId) {
     episodes = await fetchSeriesEpisodes(s, itemMeta.SeriesId).catch(() => []);
   }
 
-  const sources = (playbackInfo && Array.isArray(playbackInfo.MediaSources)) ? playbackInfo.MediaSources : [];
+  let sources = (playbackInfo && Array.isArray(playbackInfo.MediaSources)) ? playbackInfo.MediaSources : [];
   if (sources.length === 0) {
     throw { code: "plugin", message: "No playable media sources returned by Jellyfin." };
   }
-  const ms = sources[0];
-  const msId = String(ms.Id || playId);
+  let ms = sources[0];
+  let msId = String(ms.Id || playId);
+
+  // Jellyfin MediaInfoHelper only applies SubtitleStreamIndex when MediaSourceId
+  // matches the resolved media source ID. Multi-version items may return a
+  // MediaSource.Id that differs from playId, so re-request once with the actual
+  // MediaSourceId to avoid default graphical subtitles forcing CPU video burn-in.
+  if (msId && msId.toLowerCase() !== playId.toLowerCase() && !ms.SupportsDirectPlay) {
+    const refined = await requestPlaybackInfo(s, playId, req && req.hevc, msId).catch(() => null);
+    const refinedSources = (refined && Array.isArray(refined.MediaSources)) ? refined.MediaSources : [];
+    if (refinedSources.length > 0) {
+      const matched = refinedSources.find((src) => String(src && src.Id || "").toLowerCase() === msId.toLowerCase());
+      ms = matched || refinedSources[0];
+      msId = String(ms.Id || msId);
+    }
+  }
+
   const containerParts = String(ms.Container || "mp4").toLowerCase().split(",").map((c) => c.replace(/[^a-z0-9]/g, "")).filter(Boolean);
   const container = containerParts.indexOf("mp4") >= 0 ? "mp4" : (containerParts[0] || "mp4");
 
@@ -1133,10 +1201,10 @@ export async function resolvePlayback(req) {
     contentType = container === "mov" ? "video/quicktime" : "video/mp4";
   } else if (ms.TranscodingUrl) {
     streamFormat = "hls";
-    streamURL = ensureQueryToken(
-      ms.TranscodingUrl.startsWith("http") ? ms.TranscodingUrl : s.serverURL + ms.TranscodingUrl,
-      s.accessToken
-    );
+    const rawTranscodeURL = ms.TranscodingUrl.startsWith("http")
+      ? ms.TranscodingUrl
+      : s.serverURL + ms.TranscodingUrl;
+    streamURL = ensureQueryToken(stripSubtitleBurnIn(rawTranscodeURL), s.accessToken);
     contentType = "application/vnd.apple.mpegurl";
   } else {
     // Fallback to Jellyfin HLS master playlist.
