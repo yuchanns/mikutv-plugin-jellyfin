@@ -195,6 +195,138 @@ async function jfFetch(base, path, opts) {
   }
 }
 
+// Session-scoped host.cache (MikuTV >= 0.1.5). Every helper degrades to a
+// no-op on older hosts so callers fall back to plain network reads.
+const CACHE_PREFIX = "jf:v1:";
+const TTL_VIEWS = 600;
+const TTL_EPISODES = 300;
+const TTL_ITEM = 120;
+const TTL_SIMILAR = 600;
+
+function hasCache() {
+  return (
+    typeof host !== "undefined" &&
+    !!host.cache &&
+    typeof host.cache.get === "function" &&
+    typeof host.cache.set === "function"
+  );
+}
+
+function cacheGetJSON(key) {
+  if (!hasCache()) return undefined;
+  try {
+    const raw = host.cache.get(key);
+    if (typeof raw !== "string" || !raw) return undefined;
+    return JSON.parse(raw);
+  } catch (_) {
+    return undefined;
+  }
+}
+
+function cacheSetJSON(key, value, ttlSec) {
+  if (!hasCache()) return;
+  try {
+    host.cache.set(key, JSON.stringify(value), ttlSec);
+  } catch (_) {}
+}
+
+function cacheScope(s) {
+  return s.serverURL.toLowerCase() + "|" + s.userId;
+}
+
+// Generation token for entries that embed per-user play state (UserData).
+// Rotating it on progress reports orphans those entries at once; a fresh
+// random token on miss means an evicted token can never revive stale data.
+function userDataGen(s, rotate) {
+  if (!hasCache()) return "";
+  const key = CACHE_PREFIX + "gen:" + cacheScope(s);
+  if (!rotate) {
+    try {
+      const cur = host.cache.get(key);
+      if (typeof cur === "string" && cur) return cur;
+    } catch (_) {
+      return "";
+    }
+  }
+  const next = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  try {
+    host.cache.set(key, next, 0);
+  } catch (_) {
+    return "";
+  }
+  return next;
+}
+
+async function cachedJSON(key, ttlSec, load) {
+  if (!key) return load();
+  const hit = cacheGetJSON(key);
+  if (hit !== undefined) return hit;
+  const value = await load();
+  if (value !== undefined && value !== null) cacheSetJSON(key, value, ttlSec);
+  return value;
+}
+
+const SLIM_ITEM_KEYS = [
+  "Id",
+  "Type",
+  "Name",
+  "Overview",
+  "SeriesName",
+  "SeriesId",
+  "SeriesPrimaryImageTag",
+  "ParentIndexNumber",
+  "IndexNumber",
+  "ProductionYear",
+  "Genres",
+  "CommunityRating",
+  "RunTimeTicks",
+  "PremiereDate",
+  "ImageTags",
+  "BackdropImageTags",
+  "ParentBackdropItemId",
+  "ParentBackdropImageTags",
+  "ParentThumbItemId",
+  "ParentThumbImageTag",
+];
+const SLIM_USERDATA_KEYS = ["PlaybackPositionTicks", "IsFavorite", "Played", "LastPlayedDate"];
+const SLIM_STREAM_KEYS = ["Type", "Width", "Height", "VideoRange", "VideoRangeType"];
+
+function pick(src, keys) {
+  const out = {};
+  for (let i = 0; i < keys.length; i++) {
+    if (src[keys[i]] !== undefined) out[keys[i]] = src[keys[i]];
+  }
+  return out;
+}
+
+// Keep only fields read by mapMediaItem/getItem/resolvePlayback so cached
+// entries stay well under host.cache's per-entry limit (MediaSources are big).
+function slimItem(item) {
+  if (!item || typeof item !== "object") return item;
+  const out = pick(item, SLIM_ITEM_KEYS);
+  if (item.UserData && typeof item.UserData === "object") out.UserData = pick(item.UserData, SLIM_USERDATA_KEYS);
+  if (Array.isArray(item.MediaSources)) {
+    out.MediaSources = item.MediaSources.map((ms) => ({
+      MediaStreams: ms && Array.isArray(ms.MediaStreams)
+        ? ms.MediaStreams.filter((st) => st && st.Type === "Video").map((st) => pick(st, SLIM_STREAM_KEYS))
+        : [],
+    }));
+  }
+  return out;
+}
+
+async function fetchUserItem(s, id) {
+  const gen = userDataGen(s, false);
+  const key = gen ? CACHE_PREFIX + "item:" + cacheScope(s) + "|" + gen + "|" + id : "";
+  return cachedJSON(key, TTL_ITEM, async () => {
+    const item = await jfFetch(s.serverURL, "/Users/" + encodeURIComponent(s.userId) + "/Items/" + encodeURIComponent(id), {
+      deviceId: s.deviceId,
+      token: s.accessToken,
+    });
+    return item && item.Id ? slimItem(item) : null;
+  });
+}
+
 function ticksToSeconds(ticks) {
   const n = Number(ticks);
   if (!Number.isFinite(n) || n <= 0) return undefined;
@@ -450,11 +582,15 @@ export async function signOut(secret) {
 const ITEM_FIELDS = "Overview,Genres,BackdropImageTags,ImageTags,MediaSources,PrimaryImageAspectRatio,DateCreated";
 
 async function fetchViews(s) {
-  const data = await jfFetch(s.serverURL, "/Users/" + encodeURIComponent(s.userId) + "/Views", {
-    deviceId: s.deviceId,
-    token: s.accessToken,
+  const key = hasCache() ? CACHE_PREFIX + "views:" + cacheScope(s) : "";
+  return cachedJSON(key, TTL_VIEWS, async () => {
+    const data = await jfFetch(s.serverURL, "/Users/" + encodeURIComponent(s.userId) + "/Views", {
+      deviceId: s.deviceId,
+      token: s.accessToken,
+    });
+    const items = (data && Array.isArray(data.Items)) ? data.Items : [];
+    return items.map((v) => pick(v || {}, ["Id", "Name", "CollectionType"]));
   });
-  return (data && Array.isArray(data.Items)) ? data.Items : [];
 }
 
 export async function browse(req) {
@@ -669,15 +805,20 @@ export async function browse(req) {
 
 async function fetchSeriesEpisodes(s, seriesId) {
   const copy = t();
-  const data = await jfFetch(
-    s.serverURL,
-    "/Shows/" +
-      encodeURIComponent(seriesId) +
-      "/Episodes" +
-      qs({ UserId: s.userId, Fields: "Overview,MediaSources", Limit: 200 }),
-    { deviceId: s.deviceId, token: s.accessToken }
-  );
-  const rawList = (data && Array.isArray(data.Items)) ? data.Items : [];
+  // Segment output carries no play state, so this entry needs no generation.
+  const key = hasCache() ? CACHE_PREFIX + "eps:" + cacheScope(s) + "|" + seriesId : "";
+  const rawList = await cachedJSON(key, TTL_EPISODES, async () => {
+    const data = await jfFetch(
+      s.serverURL,
+      "/Shows/" +
+        encodeURIComponent(seriesId) +
+        "/Episodes" +
+        qs({ UserId: s.userId, Fields: "Overview,MediaSources", Limit: 200 }),
+      { deviceId: s.deviceId, token: s.accessToken }
+    );
+    const items = (data && Array.isArray(data.Items)) ? data.Items : [];
+    return items.map((ep) => pick(ep || {}, ["Id", "Name", "ParentIndexNumber", "IndexNumber", "RunTimeTicks"]));
+  });
   // Place regular seasons (Season 1+) ahead of Specials (Season 0).
   const list = rawList.slice().sort((a, b) => {
     const sa = a.ParentIndexNumber != null ? Number(a.ParentIndexNumber) : 9999;
@@ -708,15 +849,26 @@ async function fetchSeriesEpisodes(s, seriesId) {
   });
 }
 
+async function fetchSimilar(s, itemId) {
+  const gen = userDataGen(s, false);
+  const key = gen ? CACHE_PREFIX + "similar:" + cacheScope(s) + "|" + gen + "|" + itemId : "";
+  return cachedJSON(key, TTL_SIMILAR, async () => {
+    const data = await jfFetch(
+      s.serverURL,
+      "/Items/" + encodeURIComponent(itemId) + "/Similar" + qs({ UserId: s.userId, Limit: 12, Fields: ITEM_FIELDS }),
+      { deviceId: s.deviceId, token: s.accessToken }
+    );
+    if (!data) return null;
+    return { Items: Array.isArray(data.Items) ? data.Items.map(slimItem) : [] };
+  });
+}
+
 export async function getItem(req) {
   const s = requireSecret(req && req.secret);
   const id = String((req && (req.id || (req.ref && req.ref.id))) || "");
   if (!id) throw { code: "plugin", message: "missing item id" };
 
-  const item = await jfFetch(s.serverURL, "/Users/" + encodeURIComponent(s.userId) + "/Items/" + encodeURIComponent(id), {
-    deviceId: s.deviceId,
-    token: s.accessToken,
-  });
+  const item = await fetchUserItem(s, id);
   if (!item || !item.Id) throw { code: "plugin", message: "item not found" };
 
   const mapped = mapMediaItem(s.serverURL, s.accessToken, item);
@@ -726,11 +878,7 @@ export async function getItem(req) {
       : item.Type === "Episode" && item.SeriesId
         ? fetchSeriesEpisodes(s, item.SeriesId).catch(() => [])
         : Promise.resolve([]),
-    jfFetch(
-      s.serverURL,
-      "/Items/" + encodeURIComponent(item.Id) + "/Similar" + qs({ UserId: s.userId, Limit: 12, Fields: ITEM_FIELDS }),
-      { deviceId: s.deviceId, token: s.accessToken }
-    ).catch(() => ({ Items: [] })),
+    fetchSimilar(s, item.Id).catch(() => ({ Items: [] })),
   ]);
 
   const related = ((similarResp && similarResp.Items) || []).map((it) => mapMediaItem(s.serverURL, s.accessToken, it));
@@ -942,10 +1090,7 @@ export async function resolvePlayback(req) {
   }
 
   const [itemMeta, playbackInfo] = await Promise.all([
-    jfFetch(s.serverURL, "/Users/" + encodeURIComponent(s.userId) + "/Items/" + encodeURIComponent(playId), {
-      deviceId: s.deviceId,
-      token: s.accessToken,
-    }).catch(() => null),
+    fetchUserItem(s, playId).catch(() => null),
     jfFetch(s.serverURL, "/Items/" + encodeURIComponent(playId) + "/PlaybackInfo" + qs({ UserId: s.userId }), {
       method: "POST",
       deviceId: s.deviceId,
@@ -1165,5 +1310,7 @@ export async function reportPlayback(req) {
       },
     });
   } catch (_) {}
+  // Progress changes UserData on this item, its series and any list showing it.
+  userDataGen(s, true);
   return {};
 }
