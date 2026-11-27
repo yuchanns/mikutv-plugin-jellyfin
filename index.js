@@ -4,7 +4,7 @@
 
 const CLIENT_NAME = "MikuTV";
 const CLIENT_DEVICE = "Apple TV";
-const CLIENT_VERSION = "1.0.7";
+const CLIENT_VERSION = "1.0.8";
 const TICKS_PER_SECOND = 10000000;
 
 const COPY = {
@@ -36,6 +36,9 @@ const COPY = {
     audioTrack: (i) => `音轨 ${i}`,
     chapterTitle: (i) => `第 ${i} 章`,
     playlistFallback: "片单",
+    personCategory: "演职员",
+    birthDate: "出生日期",
+    birthPlace: "出生地",
   },
   ja: {
     serverBadge: "Jellyfin サーバー",
@@ -65,6 +68,9 @@ const COPY = {
     audioTrack: (i) => `音声 ${i}`,
     chapterTitle: (i) => `チャプター ${i}`,
     playlistFallback: "プレイリスト",
+    personCategory: "キャスト・スタッフ",
+    birthDate: "生年月日",
+    birthPlace: "出生地",
   },
   en: {
     serverBadge: "Jellyfin Server",
@@ -94,6 +100,9 @@ const COPY = {
     audioTrack: (i) => `Audio ${i}`,
     chapterTitle: (i) => `Chapter ${i}`,
     playlistFallback: "Playlist",
+    personCategory: "Cast & Crew",
+    birthDate: "Born",
+    birthPlace: "Birthplace",
   },
 };
 
@@ -308,7 +317,7 @@ const SLIM_ITEM_KEYS = [
 ];
 const SLIM_USERDATA_KEYS = ["PlaybackPositionTicks", "IsFavorite", "Played", "LastPlayedDate"];
 const SLIM_STREAM_KEYS = ["Type", "Width", "Height", "BitRate", "VideoRange", "VideoRangeType"];
-const SLIM_PERSON_KEYS = ["Id", "Name", "Type", "PrimaryImageTag"];
+const SLIM_PERSON_KEYS = ["Id", "Name", "Type", "PrimaryImageTag", "Role"];
 const SLIM_CHAPTER_KEYS = ["Name", "StartPositionTicks", "ImageTag"];
 
 function pick(src, keys) {
@@ -340,7 +349,7 @@ function slimItem(item) {
   if (Array.isArray(item.People) && item.People.length > 0) {
     out.People = item.People
       .filter((p) => p && p.Id && p.Name)
-      .slice(0, 8)
+      .slice(0, 24)
       .map((p) => pick(p, SLIM_PERSON_KEYS));
   }
   if (Array.isArray(item.Chapters) && item.Chapters.length > 0) {
@@ -899,6 +908,41 @@ async function fetchSimilar(s, itemId) {
   });
 }
 
+function buildDetailCreators(base, token, item) {
+  const people = item && Array.isArray(item.People) ? item.People : [];
+  if (people.length === 0) return [];
+  const seen = {};
+  const actorWithImg = [];
+  const actorNoImg = [];
+  const directorWithImg = [];
+  const other = [];
+  for (let i = 0; i < people.length; i++) {
+    const p = people[i];
+    if (!p || !p.Id || !p.Name) continue;
+    const id = String(p.Id).trim();
+    const name = String(p.Name).trim();
+    if (!id || !name || seen[id]) continue;
+    seen[id] = true;
+    const type = String(p.Type || "").toLowerCase();
+    const hasImg = Boolean(p.PrimaryImageTag);
+    const entry = {
+      id,
+      name,
+      avatarURL: hasImg ? imageURL(base, token, id, "Primary", p.PrimaryImageTag, 256) : "",
+      hideName: true,
+    };
+    if (type === "actor") {
+      if (hasImg) actorWithImg.push(entry);
+      else actorNoImg.push(entry);
+    } else if (type === "director" && hasImg) {
+      directorWithImg.push(entry);
+    } else {
+      other.push(entry);
+    }
+  }
+  return actorWithImg.concat(actorNoImg, directorWithImg, other).slice(0, 12);
+}
+
 export async function getItem(req) {
   const s = requireSecret(req && req.secret);
   const id = String((req && (req.id || (req.ref && req.ref.id))) || "");
@@ -908,6 +952,12 @@ export async function getItem(req) {
   if (!item || !item.Id) throw { code: "plugin", message: "item not found" };
 
   const mapped = mapMediaItem(s.serverURL, s.accessToken, item);
+  if (hasHostFeature("multiCreators")) {
+    const creators = buildDetailCreators(s.serverURL, s.accessToken, item);
+    if (creators.length > 0) {
+      mapped.creators = creators;
+    }
+  }
   const [segments, similarResp] = await Promise.all([
     item.Type === "Series"
       ? fetchSeriesEpisodes(s, item.Id).catch(() => [])
@@ -930,6 +980,109 @@ export async function getItem(req) {
     },
   };
   return mapped;
+}
+
+async function fetchPersonMeta(s, creatorID) {
+  const key = hasCache() ? CACHE_PREFIX + "person:" + cacheScope(s) + "|" + creatorID : "";
+  return cachedJSON(key, TTL_ITEM, async () => {
+    const data = await jfFetch(s.serverURL, "/Users/" + encodeURIComponent(s.userId) + "/Items/" + encodeURIComponent(creatorID), {
+      deviceId: s.deviceId,
+      token: s.accessToken,
+    });
+    if (!data || !data.Id) return null;
+    return pick(data, ["Id", "Name", "Overview", "ImageTags", "BackdropImageTags", "PremiereDate", "ProductionLocations"]);
+  });
+}
+
+async function fetchPersonFilmography(s, creatorID, startIndex, limit) {
+  const gen = userDataGen(s, false);
+  const key = gen ? CACHE_PREFIX + "personitems:" + cacheScope(s) + "|" + gen + "|" + creatorID + "|" + startIndex : "";
+  return cachedJSON(key, TTL_ITEM, async () => {
+    const data = await jfFetch(
+      s.serverURL,
+      "/Users/" +
+        encodeURIComponent(s.userId) +
+        "/Items" +
+        qs({
+          PersonIds: creatorID,
+          IncludeItemTypes: "Movie,Series",
+          Recursive: "true",
+          SortBy: "PremiereDate,ProductionYear,SortName",
+          SortOrder: "Descending",
+          StartIndex: startIndex,
+          Limit: limit,
+          Fields: ITEM_FIELDS,
+        }),
+      { deviceId: s.deviceId, token: s.accessToken }
+    );
+    if (!data) return { Items: [], TotalRecordCount: 0 };
+    return {
+      Items: Array.isArray(data.Items) ? data.Items.map(slimItem) : [],
+      TotalRecordCount: Number(data.TotalRecordCount || 0),
+    };
+  });
+}
+
+export async function readCreator(req) {
+  const s = requireSecret(req && req.secret);
+  const copy = t();
+  const creatorID = String((req && req.creatorID) || "").trim();
+  if (!creatorID) throw { code: "plugin", message: "missing creator id" };
+  const tab = String((req && req.tab) || "videos");
+  const startIndex = Math.max(0, parseInt(String((req && req.cursor) || "0"), 10) || 0);
+  const includeProfile = Boolean(req && req.includeProfile);
+  const limit = 24;
+
+  const needItems = tab === "videos" || tab === "" || includeProfile;
+  const [person, filmResp] = await Promise.all([
+    includeProfile ? fetchPersonMeta(s, creatorID).catch(() => null) : Promise.resolve(null),
+    needItems ? fetchPersonFilmography(s, creatorID, startIndex, limit).catch(() => ({ Items: [], TotalRecordCount: 0 })) : Promise.resolve(null),
+  ]);
+
+  const rawItems = (filmResp && Array.isArray(filmResp.Items)) ? filmResp.Items : [];
+  const items = rawItems.map((it) => mapMediaItem(s.serverURL, s.accessToken, it));
+  const total = Number((filmResp && filmResp.TotalRecordCount) || items.length);
+  const nextCursor = tab !== "about" && startIndex + rawItems.length < total ? String(startIndex + rawItems.length) : "";
+
+  const out = {
+    items: tab === "about" ? [] : items,
+    nextCursor,
+  };
+
+  if (includeProfile) {
+    const name = String((person && person.Name) || creatorID).trim();
+    const tags = (person && person.ImageTags) || {};
+    const avatarURL = tags.Primary ? imageURL(s.serverURL, s.accessToken, creatorID, "Primary", tags.Primary, 512) : "";
+    let backdropURL = person ? backdropURLFor(s.serverURL, s.accessToken, person) : "";
+    if (!backdropURL && items.length > 0 && items[0].backdropURL) {
+      backdropURL = items[0].backdropURL;
+    }
+    const bio = String((person && person.Overview) || "").replace(/\s+/g, " ").trim();
+    const attributes = [];
+    if (person && person.PremiereDate) {
+      const born = String(person.PremiereDate).slice(0, 10);
+      if (born) attributes.push({ label: copy.birthDate, value: born });
+    }
+    if (person && Array.isArray(person.ProductionLocations) && person.ProductionLocations.length > 0) {
+      const place = person.ProductionLocations.map((x) => String(x || "").trim()).filter(Boolean).join(", ");
+      if (place) attributes.push({ label: copy.birthPlace, value: place });
+    }
+    const tabs = bio || attributes.length > 0 ? ["videos", "about"] : ["videos"];
+    out.profile = {
+      creator: {
+        id: creatorID,
+        name,
+        avatarURL,
+      },
+      bio,
+      backdropURL,
+      category: copy.personCategory,
+      works: total,
+      attributes,
+      tabs,
+    };
+  }
+  return out;
 }
 
 export async function search(req) {

@@ -3,7 +3,7 @@
   "name": "Jellyfin",
   "description": "Your media, on your terms.",
   "kind": "source",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "apiVersion": 1,
   "minAppVersion": "0.1.0",
   "license": "Apache-2.0",
@@ -33,12 +33,17 @@
     "creatorGroupTitle": "Movies",
     "search": {
       "hint": "Search your Jellyfin library"
+    },
+    "creator": {
+      "videosLabel": "Titles",
+      "emptyVideos": "No matching titles in your library."
     }
   },
   "capabilities": [
     "account.signIn",
     "catalog.browse",
     "catalog.item",
+    "catalog.creator",
     "catalog.search",
     "catalog.searchSuggest",
     "catalog.library",
@@ -69,6 +74,10 @@
         "creatorGroupTitle": "电影",
         "search": {
           "hint": "搜索电影、剧集与单集"
+        },
+        "creator": {
+          "videosLabel": "作品",
+          "emptyVideos": "媒体库中暂无相关作品。"
         }
       }
     },
@@ -88,6 +97,10 @@
         "creatorGroupTitle": "映画",
         "search": {
           "hint": "ライブラリを検索"
+        },
+        "creator": {
+          "videosLabel": "作品",
+          "emptyVideos": "ライブラリに該当する作品がありません。"
         }
       }
     }
